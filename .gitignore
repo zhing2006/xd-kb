@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
 .env
+.p4ignore
 .idea/
 .vscode/
 *.iml
