@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+.env
+.idea/
+.vscode/
+*.iml
+/tmp/
+/npm/xd-kb/vendor/
+/npm/xd-kb/.vendor-tag
+.claude/
+.codex/

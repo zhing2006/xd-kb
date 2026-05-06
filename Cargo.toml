@@ -1,0 +1,35 @@
+[package]
+name = "xd-kb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Proprietary"
+description = "Local knowledge-base CLI: grafeo-based semantic retrieval + graph queries + file hash tracking."
+repository = "https://github.com/zhing2006/xd-kb"
+readme = "README.md"
+
+[dependencies]
+anyhow = { version = "1", default-features = false, features = ["std"] }
+blake3 = { version = "1", default-features = false, features = ["std"] }
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "color", "suggestions"] }
+dotenvy = { version = "0.15", default-features = false }
+grafeo = { version = "0.5", default-features = false, features = ["gql", "lpg", "grafeo-file", "ai", "algos"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_yaml_ng = { version = "0.10", default-features = false }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
+walkdir = { version = "2", default-features = false }
+
+[build-dependencies]
+static_vcruntime = { version = "3", default-features = false }
+
+[dev-dependencies]
+http = "1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

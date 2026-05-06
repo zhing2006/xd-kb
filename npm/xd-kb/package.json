@@ -1,0 +1,27 @@
+{
+  "name": "xd-kb",
+  "version": "0.1.0",
+  "description": "npm wrapper for the xd-kb Rust CLI",
+  "license": "Proprietary",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhing2006/xd-kb"
+  },
+  "bin": {
+    "xd-kb": "./bin/xd-kb.js"
+  },
+  "files": [
+    "bin",
+    "vendor",
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "fetch:release": "node scripts/fetch-release-assets.js",
+    "pack:local": "node scripts/pack-local.js",
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

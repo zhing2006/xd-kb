@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95'
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry / target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo build --workspace --release
+        run: cargo build --workspace --release
+
+      # Windows-only: confirm VCRuntime is statically linked. UCRT
+      # (api-ms-win-crt-*.dll, ucrtbase.dll) is intentionally left dynamic
+      # — it's a Windows OS component and always present.
+      - name: Verify static VCRuntime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "target/release/xd-kb.exe"
+          if (-not (Test-Path $exe)) { throw "Missing $exe" }
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsRoot) { throw "vswhere could not locate a VS install with VC tools" }
+          $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe -ErrorAction Stop |
+            Where-Object { $_.FullName -match 'Hostx64\\x64\\dumpbin\.exe$' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
+          $imports = & $dumpbin /imports $exe 2>&1 | Out-String
+          $bad = "vcruntime140.dll", "msvcr"
+          $hits = $bad | Where-Object { $imports -match [regex]::Escape($_) }
+          if ($hits) {
+            Write-Error "Dynamic VCRuntime imports found in $exe : $($hits -join ', ')"
+            exit 1
+          }
+          Write-Host "OK: VCRuntime is statically linked in $exe"

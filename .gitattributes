@@ -1,0 +1,17 @@
+# Force LF on every text file in the working tree so Windows checkouts
+# (GitHub Actions runners default to core.autocrlf=true) don't bake CRLF
+# into source. Mismatched line endings break golden compares and snapshot
+# tests in invisible ways.
+* text=auto eol=lf
+
+# Markdown fixtures are parsed; CRLF would still be normalised at parse
+# time, but keeping them LF avoids surprise diffs in fixture edits.
+*.md text eol=lf
+
+# Binaries: do not touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary

@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: win32-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: xd-kb.exe
+            asset: xd-kb-win32-x64.exe
+
+          - name: linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: xd-kb
+            asset: xd-kb-linux-x64
+
+          - name: linux-arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            binary: xd-kb
+            asset: xd-kb-linux-arm64
+
+          - name: darwin-x64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            binary: xd-kb
+            asset: xd-kb-darwin-x64
+
+          - name: darwin-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            binary: xd-kb
+            asset: xd-kb-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95'
+          targets: ${{ matrix.target }}
+
+      # Linux musl toolchain — local build needs musl-tools; cross handles arm64.
+      - name: Install musl-tools (Linux x64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross (Linux arm64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        # Pin cross to a released crates.io version so tag releases are
+        # reproducible. Bump deliberately; do NOT track upstream master.
+        run: cargo install cross --version 0.2.5 --locked
+
+      # Build steps. macOS deliberately does NOT use crt-static — Apple
+      # targets use the platform default linker/SDK. MACOSX_DEPLOYMENT_TARGET
+      # pins the minimum supported macOS version.
+      - name: Build (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (macOS)
+        if: startsWith(matrix.target, 'x86_64-apple') || startsWith(matrix.target, 'aarch64-apple')
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+      - name: Build (Windows / Linux x64)
+        if: matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # Windows-only: verify VCRuntime is statically linked. UCRT
+      # (api-ms-win-crt-*.dll, ucrtbase.dll) is intentionally left dynamic
+      # — it's a Windows OS component and always present.
+      - name: Verify static VCRuntime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsRoot) { throw "vswhere could not locate a VS install with VC tools" }
+          $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe -ErrorAction Stop |
+            Where-Object { $_.FullName -match 'Hostx64\\x64\\dumpbin\.exe$' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
+          $imports = & $dumpbin /imports $exe 2>&1 | Out-String
+          $bad = "vcruntime140.dll", "msvcr"
+          $hits = $bad | Where-Object { $imports -match [regex]::Escape($_) }
+          if ($hits) {
+            Write-Error "Dynamic VCRuntime imports found: $($hits -join ', ')"
+            exit 1
+          }
+
+      # Smoke test the built binary before uploading.
+      - name: Smoke test (--version)
+        if: matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'aarch64-apple-darwin'
+        run: ./target/${{ matrix.target }}/release/${{ matrix.binary }} --version
+        shell: bash
+
+      # Rename and upload.
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset }}
+          chmod +x ${{ matrix.asset }}
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          files=()
+          for dir in artifacts/*/; do
+            for file in "$dir"*; do
+              [ -f "$file" ] && files+=("$file")
+            done
+          done
+          gh release create "$tag" "${files[@]}" \
+            --title "$tag" \
+            --generate-notes
