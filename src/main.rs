@@ -59,6 +59,7 @@ fn resolve_fetch_pool(top: usize, fetch_pool: Option<usize>) -> Result<usize> {
 #[derive(Parser, Debug)]
 #[command(
     name = "xd-kb",
+    version,
     about = "Local knowledge-base engine: semantic search + GQL + file-hash tracking, backed by grafeo. One DB path = one KB."
 )]
 struct Cli {
