@@ -15,4 +15,4 @@ This directory is tracked by both P4 and git:
 
 ## Local Pack Output
 
-`npm run pack:local` (run from `npm/xd-kb/`) writes the tarball to `../packages/` **outside** this repo, which resolves to the workspace path `Tools/packages/`. That directory is tracked by neither P4 nor git.
+`npm run pack:local` (run from `npm/xd-kb/`) writes the tarball to `../packages/` **outside** this repo, which resolves to the workspace path `Tools/packages/`. That directory is tracked by **P4 only** (it sits outside the git repo root). After each release, `p4 add` the new `.tgz` and submit it.
