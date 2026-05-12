@@ -124,7 +124,12 @@ enum Commands {
     },
     /// Check / mark a file's content hash against grafeo FileHash nodes
     Check {
-        /// File path (absolute or relative to current dir)
+        /// File path. With explicit `--root <dir>`, this is interpreted
+        /// relative to that root (`disk = <root>/<file>`, store key =
+        /// `<file>` normalised). With implicit `.xd-kb.yaml` discovery, this
+        /// is interpreted relative to **cwd** (`disk = <cwd>/<file>`, store
+        /// key = `<cwd-rel-to-root>/<file>` normalised). Without any root,
+        /// the path is used verbatim for both disk read and storage write.
         file: PathBuf,
         /// Update the stored hash (or remove the node if file is gone)
         #[arg(long)]
@@ -135,6 +140,18 @@ enum Commands {
         /// snake-case `<dim>_hash` (e.g. vector-2 → vector_2_hash).
         #[arg(long = "type", value_enum)]
         dim: HashDim,
+        /// Explicit KB root. `<file>` is then resolved relative to this dir
+        /// for disk reads, and `:FileHash.path` is written as the
+        /// forward-slash-normalized relative form so it matches what
+        /// `xd-kb index <root>` writes for the same file. Omitting this flag
+        /// triggers an upward search for `.xd-kb.yaml` from cwd; on a hit
+        /// the discovered dir becomes the implicit root and `<file>` is
+        /// interpreted **relative to cwd** (NOT to the implicit root) — the
+        /// store key is then `cwd-rel-to-root + <file>`. With no `--root`
+        /// and no ancestor `.xd-kb.yaml`, falls back to the legacy verbatim
+        /// path behaviour.
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
 }
 
@@ -165,7 +182,12 @@ async fn main() -> Result<()> {
             query::run(&cli.db, &text, top, lambda, fetch_pool, &retry_config).await
         }
         Commands::Gql { statement } => gql::run(&cli.db, &statement),
-        Commands::Check { file, mark, dim } => check::run(&cli.db, &file, dim, mark),
+        Commands::Check {
+            file,
+            mark,
+            dim,
+            root,
+        } => check::run(&cli.db, &file, dim, mark, root.as_deref()),
     }
 }
 
@@ -323,10 +345,42 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Check { file, mark, dim } => {
+            Commands::Check {
+                file,
+                mark,
+                dim,
+                root,
+            } => {
                 assert_eq!(file, PathBuf::from("x.md"));
                 assert!(mark);
                 assert_eq!(dim, HashDim::Vector);
+                assert!(root.is_none(), "no --root passed → expect None");
+            }
+            _ => panic!("expected Check"),
+        }
+    }
+
+    #[test]
+    fn parses_check_with_root() {
+        let cli = try_parse(&[
+            "xd-kb",
+            "--db",
+            "./kb.db",
+            "check",
+            "故事/X.md",
+            "--type",
+            "graph",
+            "--root",
+            "Wiki/example-kb",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Check {
+                file, root, dim, ..
+            } => {
+                assert_eq!(file, PathBuf::from("故事/X.md"));
+                assert_eq!(root, Some(PathBuf::from("Wiki/example-kb")));
+                assert_eq!(dim, HashDim::Graph);
             }
             _ => panic!("expected Check"),
         }

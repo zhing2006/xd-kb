@@ -1,5 +1,4 @@
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use serde::Deserialize;
 
 pub struct Chunk {
     pub content: String,
@@ -27,123 +26,10 @@ struct RawChunk {
     pub byte_end: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileCategory {
-    CharacterProfile,
-    WorldView,
-    Script,
-    Bond,
-    SceneTable,
-    GlobalEncyclopedia,
-    CharacterPlotIndex,
-    CGIndex,
-    PanoramaDoc,
-    VoiceLineTable,
-}
-
-impl FileCategory {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::CharacterProfile => "角色档案",
-            Self::WorldView => "世界观",
-            Self::Script => "台本",
-            Self::Bond => "羁绊",
-            Self::SceneTable => "场表",
-            Self::GlobalEncyclopedia => "百科",
-            Self::CharacterPlotIndex => "角色剧情索引",
-            Self::CGIndex => "CG索引",
-            Self::PanoramaDoc => "全景文档",
-            Self::VoiceLineTable => "语音台词总表",
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct Frontmatter {
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub aliases: Option<Vec<String>>,
-    #[serde(default)]
-    pub faction: Option<String>,
-    #[serde(default)]
-    pub route: Option<String>,
-    #[serde(default)]
-    pub scene: Option<String>,
-    #[serde(default)]
-    pub characters: Option<Vec<String>>,
-    #[serde(default)]
-    pub performance_type: Option<String>,
-}
-
-// --- Category detection ---
-
-fn detect_category(rel_path: &str) -> Option<FileCategory> {
-    let path = rel_path.replace('\\', "/");
-
-    if path == "故事/全局百科.md" {
-        return Some(FileCategory::GlobalEncyclopedia);
-    }
-    if path == "故事/_角色剧情索引.md" {
-        return Some(FileCategory::CharacterPlotIndex);
-    }
-    if path == "故事/_CG索引.md" {
-        return Some(FileCategory::CGIndex);
-    }
-    if path == "角色/角色语音台词总表.md" {
-        return Some(FileCategory::VoiceLineTable);
-    }
-    if path == "剧本全景.md" || path == "剧情梗概流程图.md" {
-        return Some(FileCategory::PanoramaDoc);
-    }
-
-    if path.starts_with("故事/") && path.ends_with(".md") {
-        let filename = path.rsplit('/').next().unwrap_or("");
-        if filename.starts_with('_') && filename.ends_with("场表.md") {
-            return Some(FileCategory::SceneTable);
-        }
-    }
-
-    if path.starts_with("故事/羁绊/") && path.contains("羁绊") && path.ends_with(".md") {
-        return Some(FileCategory::Bond);
-    }
-
-    if path.starts_with("故事/") && path.ends_with(".md") {
-        let filename = path.rsplit('/').next().unwrap_or("");
-        if filename.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            return Some(FileCategory::Script);
-        }
-    }
-
-    if path.starts_with("角色/") && path.ends_with(".md") {
-        let rest = &path["角色/".len()..];
-        if !rest.contains('/') && !rest.starts_with('_') {
-            return Some(FileCategory::CharacterProfile);
-        }
-    }
-
-    if path.starts_with("世界观/") && path.ends_with(".md") {
-        return Some(FileCategory::WorldView);
-    }
-
-    None
-}
-
-// --- Frontmatter parsing ---
-
-fn parse_frontmatter(content: &str) -> Frontmatter {
-    if !content.starts_with("---") {
-        return Frontmatter::default();
-    }
-    let rest = &content[3..];
-    if let Some(end) = rest.find("\n---") {
-        let yaml = &rest[..end];
-        serde_yaml_ng::from_str(yaml).unwrap_or_default()
-    } else {
-        Frontmatter::default()
-    }
-}
-
+// `frontmatter_end_offset` only needs to skip a leading YAML frontmatter block
+// so chunkers don't include it as document body. Field-level YAML parsing is
+// no longer performed: chunk prefixes carry only generic heading_path metadata,
+// not KB-specific frontmatter projections.
 fn frontmatter_end_offset(content: &str) -> usize {
     if !content.starts_with("---") {
         return 0;
@@ -334,14 +220,16 @@ fn build_heading_path(all_headings: &[HeadingMark], target_idx: usize) -> Vec<St
 }
 
 fn chunk_whole_file(content: &str) -> Vec<RawChunk> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
+    // Skip leading YAML frontmatter so heading-less docs with frontmatter
+    // don't leak the YAML block into the indexed chunk body.
+    let content_start = frontmatter_end_offset(content);
+    let (byte_start, byte_end) = trim_byte_range(content, content_start, content.len());
+    if byte_start == byte_end {
         return Vec::new();
     }
-    let (byte_start, byte_end) = trim_byte_range(content, 0, content.len());
     let line_starts = build_line_starts(content);
     vec![RawChunk {
-        content: trimmed.to_string(),
+        content: content[byte_start..byte_end].to_string(),
         line_start: offset_to_line(&line_starts, byte_start),
         line_end: offset_to_line(&line_starts, byte_end.saturating_sub(1).max(byte_start)),
         heading_path: Vec::new(),
@@ -350,21 +238,20 @@ fn chunk_whole_file(content: &str) -> Vec<RawChunk> {
     }]
 }
 
-fn chunk_file(content: &str, category: FileCategory) -> Vec<RawChunk> {
-    match category {
-        FileCategory::CharacterProfile
-        | FileCategory::SceneTable
-        | FileCategory::CharacterPlotIndex
-        | FileCategory::CGIndex
-        | FileCategory::PanoramaDoc
-        | FileCategory::VoiceLineTable => chunk_by_heading(content, &[HeadingLevel::H2]),
-
-        FileCategory::WorldView => chunk_by_heading(content, &[HeadingLevel::H2, HeadingLevel::H3]),
-
-        FileCategory::GlobalEncyclopedia => chunk_by_heading(content, &[HeadingLevel::H3]),
-
-        FileCategory::Script | FileCategory::Bond => chunk_whole_file(content),
+// Generic chunker for any markdown file: split on H2 headings; if the file has
+// no H2, fall back to H3; if neither, treat the whole file as one chunk.
+// Splitting policy is intentionally simple — KB-specific tuning belongs in the
+// KB's own `.xd-kb.yaml`-driven preprocessing, not in the engine.
+fn chunk_file(content: &str) -> Vec<RawChunk> {
+    let chunks = chunk_by_heading(content, &[HeadingLevel::H2]);
+    if !chunks.is_empty() {
+        return chunks;
     }
+    let chunks = chunk_by_heading(content, &[HeadingLevel::H3]);
+    if !chunks.is_empty() {
+        return chunks;
+    }
+    chunk_whole_file(content)
 }
 
 // --- Oversized chunk splitting ---
@@ -621,73 +508,24 @@ fn split_oversized(
     out
 }
 
-// --- Prefix generation ---
+// --- Heading-path prefix ---
 
-fn generate_prefix(
-    category: FileCategory,
-    frontmatter: &Frontmatter,
-    heading_path: &[String],
-    rel_path: &str,
-) -> String {
-    match category {
-        FileCategory::CharacterProfile => {
-            let name = frontmatter.name.as_deref().unwrap_or("unknown");
-            let aliases = frontmatter
-                .aliases
-                .as_ref()
-                .map(|a| a.join(","))
-                .unwrap_or_default();
-            let faction = frontmatter.faction.as_deref().unwrap_or("");
-            format!(
-                "[角色档案 | {} | 别名:{} | 势力:{}]",
-                name, aliases, faction
-            )
-        }
-        FileCategory::Script => {
-            let route = frontmatter.route.as_deref().unwrap_or("");
-            let scene = frontmatter.scene.as_deref().unwrap_or("");
-            let perf = frontmatter.performance_type.as_deref().unwrap_or("");
-            let chars = frontmatter
-                .characters
-                .as_ref()
-                .map(|c| c.join(","))
-                .unwrap_or_default();
-            format!("[台本 | {} | {} | {} | 登场:{}]", route, scene, perf, chars)
-        }
-        FileCategory::WorldView => {
-            let section = heading_path.join(" > ");
-            format!("[世界观 | {} | {}]", rel_path, section)
-        }
-        FileCategory::Bond => {
-            let chars = frontmatter
-                .characters
-                .as_ref()
-                .map(|c| c.join(","))
-                .unwrap_or_default();
-            format!("[羁绊 | {}]", chars)
-        }
-        FileCategory::GlobalEncyclopedia => {
-            let category_name = heading_path.first().map(|s| s.as_str()).unwrap_or("");
-            let entry = heading_path.last().map(|s| s.as_str()).unwrap_or("");
-            format!("[百科 | {} | {}]", category_name, entry)
-        }
-        _ => {
-            format!("[{} | {}]", category.label(), rel_path)
-        }
-    }
+// Heading-path prefix: the chunk's heading ancestors joined by " > ", used
+// only as :Chunk.prefix metadata. Empty when the chunk has no heading_path
+// (e.g. whole-file fallback for a heading-less doc).
+fn generate_heading_prefix(heading_path: &[String]) -> String {
+    heading_path.join(" > ")
 }
 
-pub fn process_file(content: &str, rel_path: &str, limits: &ChunkLimits) -> Option<Vec<Chunk>> {
-    let category = detect_category(rel_path)?;
-    let frontmatter = parse_frontmatter(content);
-    let raw_chunks = chunk_file(content, category);
+pub fn process_file(content: &str, _rel_path: &str, limits: &ChunkLimits) -> Vec<Chunk> {
+    let raw_chunks = chunk_file(content);
     let line_starts = build_line_starts(content);
     let raw_chunks = split_oversized(raw_chunks, content, &line_starts, limits.max_chars as usize);
 
-    let chunks = raw_chunks
+    raw_chunks
         .into_iter()
         .map(|raw| {
-            let prefix = generate_prefix(category, &frontmatter, &raw.heading_path, rel_path);
+            let prefix = generate_heading_prefix(&raw.heading_path);
             Chunk {
                 content: raw.content,
                 line_start: raw.line_start,
@@ -695,9 +533,7 @@ pub fn process_file(content: &str, rel_path: &str, limits: &ChunkLimits) -> Opti
                 prefix,
             }
         })
-        .collect();
-
-    Some(chunks)
+        .collect()
 }
 
 #[cfg(test)]
@@ -722,35 +558,18 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_character_profile() {
-        assert_eq!(
-            detect_category("角色/科尔.md"),
-            Some(FileCategory::CharacterProfile)
-        );
+    fn frontmatter_end_offset_skips_yaml_block() {
+        let content = "---\nname: 科尔\n---\n# Body\n";
+        let off = frontmatter_end_offset(content);
+        assert!(off > 0);
+        // Body starts after the closing ---\n
+        assert!(content[off..].starts_with("# Body"));
     }
 
     #[test]
-    fn test_detect_script() {
-        assert_eq!(
-            detect_category("故事/主线/第10章/001_命运之轮1.md"),
-            Some(FileCategory::Script)
-        );
-    }
-
-    #[test]
-    fn test_detect_unknown() {
-        assert_eq!(detect_category("故事/_INDEX.md"), None);
-        assert_eq!(detect_category("_索引.md"), None);
-    }
-
-    #[test]
-    fn test_parse_frontmatter_basic() {
-        let content =
-            "---\nname: 科尔\naliases:\n  - 面具刺客\nfaction: 米格尔佣兵团\n---\n# Content";
-        let fm = parse_frontmatter(content);
-        assert_eq!(fm.name.as_deref(), Some("科尔"));
-        assert_eq!(fm.aliases.as_ref().unwrap(), &["面具刺客"]);
-        assert_eq!(fm.faction.as_deref(), Some("米格尔佣兵团"));
+    fn frontmatter_end_offset_returns_zero_when_absent() {
+        assert_eq!(frontmatter_end_offset("# Body\n"), 0);
+        assert_eq!(frontmatter_end_offset(""), 0);
     }
 
     #[test]
@@ -799,12 +618,72 @@ mod tests {
     }
 
     #[test]
-    fn test_process_file_end_to_end() {
-        let content = "---\nname: 科尔\nfaction: 米格尔佣兵团\n---\n## 背景\n科尔的背景描述\n## 能力\n科尔的能力描述\n";
-        let chunks = process_file(content, "角色/科尔.md", &unlimited()).expect("should detect");
+    fn process_file_uses_h2_split_with_heading_path_prefix() {
+        let content = "## 背景\n背景描述\n## 能力\n能力描述\n";
+        let chunks = process_file(content, "any/path.md", &unlimited());
         assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].prefix.contains("科尔"));
-        assert!(chunks[0].prefix.contains("米格尔佣兵团"));
+        assert_eq!(chunks[0].prefix, "背景");
+        assert_eq!(chunks[1].prefix, "能力");
+        // Generic prefix MUST NOT contain any KB-specific category label
+        for ck in &chunks {
+            assert!(!ck.prefix.contains("角色档案"));
+            assert!(!ck.prefix.contains("台本"));
+            assert!(!ck.prefix.contains('['));
+        }
+    }
+
+    #[test]
+    fn process_file_falls_back_to_h3_when_no_h2() {
+        let content = "### Sub A\ncontent A\n### Sub B\ncontent B\n";
+        let chunks = process_file(content, "any.md", &unlimited());
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].prefix, "Sub A");
+        assert_eq!(chunks[1].prefix, "Sub B");
+    }
+
+    #[test]
+    fn process_file_falls_back_to_whole_file_when_no_headings() {
+        let content = "just some prose, no headings at all.\n";
+        let chunks = process_file(content, "any.md", &unlimited());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].prefix, "");
+        assert!(chunks[0].content.contains("just some prose"));
+    }
+
+    #[test]
+    fn process_file_whole_file_fallback_skips_frontmatter() {
+        // Heading-less doc with YAML frontmatter: the YAML block MUST NOT be
+        // included in the chunk content. Regression for the whole-file path
+        // that previously trimmed from byte 0 and indexed the YAML.
+        // Layout: line 1 `---`, line 2 `tags: [a, b]`, line 3 `---`,
+        //         line 4 `just some prose, no headings.`, line 5 (empty).
+        let content = "---\ntags: [a, b]\n---\njust some prose, no headings.\n";
+        let chunks = process_file(content, "any.md", &unlimited());
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            !chunks[0].content.contains("tags:"),
+            "frontmatter MUST NOT leak into whole-file chunk: {:?}",
+            chunks[0].content
+        );
+        assert!(
+            !chunks[0].content.contains("---"),
+            "frontmatter delimiter MUST NOT leak into chunk: {:?}",
+            chunks[0].content
+        );
+        assert!(chunks[0].content.contains("just some prose"));
+
+        // Line range MUST land on the body, not on the YAML block. A
+        // regression that trims from byte 0 would report line_start = 1.
+        assert_eq!(
+            chunks[0].line_start, 4,
+            "whole-file chunk after frontmatter MUST start at body line 4, got {}",
+            chunks[0].line_start
+        );
+        assert_eq!(
+            chunks[0].line_end, 4,
+            "whole-file chunk's body ends on line 4, got {}",
+            chunks[0].line_end
+        );
     }
 
     // --- split_oversized tests ---

@@ -346,13 +346,117 @@ impl KbStore {
         Ok(())
     }
 
-    /// Delete every node related to `file_path`: all `:Chunk` rows AND the entire
-    /// `:FileHash` node — regardless of how many `<dim>_hash` properties the
-    /// `:FileHash` node still carries. This is the cleanup path for `index --incremental`
-    /// when the markdown file has been removed from disk; per spec, leaving behind a
-    /// `:FileHash` node with non-vector dim hashes pointing at a deleted file would
-    /// be an orphan (other pipelines also key off `path`), so we DETACH DELETE the
-    /// whole node rather than only stripping `vector_hash`.
+    /// Per-dim cleanup for the **vector** pipeline: drop all `:Chunk` rows for
+    /// `file_path`, REMOVE `:FileHash {path: $f}.vector_hash`, and DETACH DELETE
+    /// the `:FileHash` node IFF removing `vector_hash` leaves no other dim
+    /// hash on it. Other dims' hashes (graph_hash, llm_hash, ...) MUST stay
+    /// intact when present — they belong to other pipelines and are owned
+    /// exclusively by `check --type <dim> --mark`.
+    ///
+    /// This is the path `index --incremental` takes when a previously-indexed
+    /// markdown file is missing from disk; using `delete_file_completely`
+    /// here would unconditionally orphan other dims' hashes, which violates
+    /// the per-dim FileHash contract documented in storage.rs:1-13.
+    pub fn delete_vector_dim_for_file(&self, file_path: &str) -> Result<()> {
+        let mut session = self.db.session();
+        session
+            .begin_transaction()
+            .map_err(|e| anyhow!("begin txn for delete_vector_dim_for_file: {e}"))?;
+        let res = (|| -> Result<()> {
+            // 1. Drop all :Chunk rows for this file (vector pipeline owns them).
+            let mut p_chunks = HashMap::new();
+            p_chunks.insert("path".to_string(), Value::from(file_path));
+            session
+                .execute_with_params(
+                    "MATCH (c:Chunk {file_path: $path}) DETACH DELETE c",
+                    p_chunks,
+                )
+                .map_err(|e| anyhow!("delete chunks for {file_path}: {e}"))?;
+
+            // 2. Read the FileHash node's 9 dim columns to decide whether to
+            // DETACH DELETE the whole node (vector_hash was the last non-null
+            // dim) or just REMOVE the vector_hash property. Same two-phase
+            // shape as `remove_file_hash`; see that function's grafeo 0.5
+            // probe notes for why a single-statement variant won't compile.
+            let select_cols: Vec<String> = HashDim::ALL
+                .iter()
+                .map(|d| format!("h.{}", d.property_name()))
+                .collect();
+            let read_stmt = format!(
+                "MATCH (h:FileHash {{path: $path}}) RETURN {}",
+                select_cols.join(", ")
+            );
+            let mut read_params = HashMap::new();
+            read_params.insert("path".to_string(), Value::from(file_path));
+            let read_res = session
+                .execute_with_params(&read_stmt, read_params)
+                .map_err(|e| anyhow!("read FileHash dims for {file_path}: {e}"))?;
+
+            let rows = read_res.rows();
+            if rows.is_empty() {
+                // No FileHash node — nothing to clean (e.g. file was indexed
+                // then its FileHash was already wiped by force-rebuild).
+                return Ok(());
+            }
+
+            let row = &rows[0];
+            let mut non_null_count = 0usize;
+            let mut vector_present = false;
+            for (i, d) in HashDim::ALL.iter().enumerate() {
+                let cell = row.get(i).unwrap_or(&Value::Null);
+                if !matches!(cell, Value::Null) {
+                    non_null_count += 1;
+                    if *d == HashDim::Vector {
+                        vector_present = true;
+                    }
+                }
+            }
+
+            // If vector_hash isn't on the node we have nothing to remove —
+            // the chunks DELETE above already handled the vector-pipeline
+            // side. Idempotent.
+            if !vector_present {
+                return Ok(());
+            }
+
+            let mut write_params = HashMap::new();
+            write_params.insert("path".to_string(), Value::from(file_path));
+            if non_null_count == 1 {
+                // vector_hash was the only dim — drop the whole node.
+                session
+                    .execute_with_params(
+                        "MATCH (h:FileHash {path: $path}) DETACH DELETE h",
+                        write_params,
+                    )
+                    .map_err(|e| anyhow!("delete FileHash node for {file_path}: {e}"))?;
+            } else {
+                // Other dims still carry hashes — only strip vector_hash.
+                session
+                    .execute_with_params(
+                        "MATCH (h:FileHash {path: $path}) REMOVE h.vector_hash",
+                        write_params,
+                    )
+                    .map_err(|e| anyhow!("remove vector_hash for {file_path}: {e}"))?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => session.commit().map_err(|e| anyhow!("commit: {e}")),
+            Err(e) => {
+                let _ = session.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Force-rebuild helper: drop every node related to `file_path` — all
+    /// `:Chunk` rows AND the whole `:FileHash` node, regardless of which
+    /// `<dim>_hash` properties the node still carries.
+    ///
+    /// **Not used by `index --incremental`** — incremental cleanup goes
+    /// through [`delete_vector_dim_for_file`] to honour the per-dim contract.
+    /// Reserve this function for explicit force-rebuild paths where the
+    /// caller knows it's safe to nuke other dims too.
     pub fn delete_file_completely(&self, file_path: &str) -> Result<()> {
         let mut session = self.db.session();
         session

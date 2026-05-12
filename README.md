@@ -92,7 +92,39 @@ xd-kb --db ./kb.db gql "MATCH (c:Chunk) RETURN c.file_path LIMIT 10"
 #      vector / graph / llm / fulltext / summary / entity / vector-2 / custom / custom-2
 xd-kb --db ./kb.db check ./docs/x.md --type vector
 xd-kb --db ./kb.db check ./docs/x.md --type vector --mark
+
+# 7. check 配合 --root：让写入的 :FileHash.path 与 index 的 :Chunk.file_path 对齐
+xd-kb --db ./kb.db check --root Wiki/example-kb 故事/X.md --type graph --mark
 ```
+
+### `.xd-kb.yaml` 配置（index 子命令）
+
+`index` 子命令在 `<markdown-root>/.xd-kb.yaml` 找配置，决定哪些 markdown 入库：
+
+```yaml
+include:
+  - "**/*.md"
+exclude:
+  - "drafts/**"
+  - "**/scratch.md"
+```
+
+- `include` / `exclude` 字段 MUST 都为相对索引根的 glob 列表；`exclude` 优先于 `include`。
+- 配置缺少 `include` 时视为 `["**/*.md"]`；缺少 `exclude` 时视为空列表。
+- 引擎内置一组兜底 `DEFAULT_EXCLUDES = [".kb/**", ".xd-kb.yaml", "WIKI.md", "log.md"]`，与用户 `exclude` 集合并；用户 `include` 不可抵消（防止引擎自身产物 / 配置文件 / 常见 KB 副产物被入库）。
+- `.xd-kb.yaml` 不存在时引擎按 `include = ["**/*.md"]` + `DEFAULT_EXCLUDES` 兜底处理，「无配置即可用」。
+- yaml 解析失败、glob 编译失败 → CLI 以非零退出码报错并指出 `.xd-kb.yaml` 路径。
+
+哪些文件入库完全由 `.xd-kb.yaml` 声明；引擎不消费任何 KB 专属约定（不识别 path 模式、不读取 frontmatter 字段做投影、不维护文件类型枚举）。
+
+### `check --root <dir>` 路径对齐
+
+`check` 子命令默认按用户传入字符串原样读盘 + 原样写库（保持向后兼容）。需要让 `check` 的 `:FileHash.path` 与 `index` 写入的 `:Chunk.file_path` 完全对齐时，加 `--root <dir>`：
+
+- 显式 `--root <dir>` 时：`<file>` 视为相对 `<dir>` 的路径；xd-kb 内部读盘路径为 `<dir>/<file>`，写入的 `:FileHash.path` 为 `<file>`（规范化后的相对路径）。
+- 隐式探测（未传 `--root`、cwd 向上找到 `.xd-kb.yaml`）：探测到的目录为隐式 root；`<file>` 视为相对 **cwd** 的路径，读盘路径为 `<cwd>/<file>`，写入的 `:FileHash.path` 为 `<cwd>` 相对隐式 root 的路径再拼 `<file>`（规范化后）。
+- 两种模式共享同一组规范化与安全检查：分隔符 `\` / `/` / 混合都接受、统一写为 `/`；`./` 段被丢弃；非逃逸 `..` 段被弹出；逃逸 root 的 `..`、绝对路径、读盘失败均以非零退出码报错。
+- 都未命中（无 `--root` 且无任何祖先 `.xd-kb.yaml`）时退回向后兼容分支：按用户原样字符串读盘 + 原样写库。
 
 ### Query：相关性 vs 多样性（`--lambda` / `--fetch-pool`）
 
@@ -115,6 +147,6 @@ xd-kb --db ./kb.db check ./docs/x.md --type vector --mark
 
 `:FileHash` 节点为同一份 markdown 同时承载 9 个独立维度的 hash：`{path, vector_hash?, graph_hash?, llm_hash?, fulltext_hash?, summary_hash?, entity_hash?, vector_2_hash?, custom_hash?, custom_2_hash?}`，`path` 是唯一键。
 
-- `index` 子命令只读写 `vector_hash`（增量比对、删除清理整节点 DETACH DELETE）。
+- `index` 子命令只读写 `vector_hash`（增量比对、增量删除走 per-dim 协议：DETACH DELETE 该文件的所有 `:Chunk` + REMOVE `:FileHash.vector_hash`；当且仅当节点上无其它非空 `<dim>_hash` 时整节点 DETACH DELETE，否则节点保留、其它 dim 的 hash 完整无损）。
 - 其他 8 个维度（graph / llm / fulltext / summary / entity / vector-2 / custom / custom-2）的 hash 仅由 `check --type <dim> --mark` 维护：`--mark` 写入对应 `<dim>_hash` 属性，删除文件时若该 dim 是节点上最后一个非空 hash 则整节点删除，否则只 REMOVE 该属性。
 - `check` 输出格式始终是单行 `[<status>] <file>`（不带 dim 后缀），`--mark` 真正清理了节点或属性时追加 ` -> [removed]`。

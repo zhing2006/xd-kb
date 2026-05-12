@@ -6,7 +6,7 @@ use std::pin::Pin;
 use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 
-use crate::config::Config;
+use crate::config::{Config, KbConfig};
 use crate::embedding::{RetryConfig, embed_batch};
 use crate::markdown::{Chunk, ChunkLimits, process_file};
 use crate::storage::{ChunkInput, HashDim, KbStore};
@@ -148,7 +148,10 @@ async fn run_with_embedder(
         let stored_paths = store.list_file_paths()?;
         for p in stored_paths {
             if !on_disk.contains(&p) {
-                if let Err(e) = store.delete_file_completely(&p) {
+                // Per-dim cleanup: only the vector pipeline's data
+                // (`:Chunk` rows + `vector_hash` property) is removed; other
+                // dims' hashes on the same `:FileHash` node stay intact.
+                if let Err(e) = store.delete_vector_dim_for_file(&p) {
                     eprintln!("[fail-delete] {p}: {e}");
                     stats.failed += 1;
                 } else {
@@ -178,32 +181,22 @@ async fn process_one_file(
     batch_size: usize,
     limits: &ChunkLimits,
 ) -> Result<usize> {
-    let chunks: Vec<Chunk> = match process_file(content, rel_path, limits) {
-        Some(v) => v,
-        None => return Ok(0), // markdown rejected by category detector — nothing to index
-    };
-    // Empty chunk list for a recognized file: still treat as a valid upsert with zero
-    // chunks so storage deletes any prior chunks AND refreshes the FileHash atomically.
-    // Without this, a file that previously produced chunks but no longer does would
-    // leave stale chunks in grafeo and incremental mode would re-process it every run
-    // (because the hash never advances).
+    let chunks: Vec<Chunk> = process_file(content, rel_path, limits);
+    // Empty chunk list (e.g. an empty markdown file): still treat as a valid upsert
+    // with zero chunks so storage deletes any prior chunks AND refreshes the
+    // FileHash atomically. Without this, a file that previously produced chunks
+    // but no longer does would leave stale chunks in grafeo and incremental mode
+    // would re-process it every run (because the hash never advances).
     if chunks.is_empty() {
         store.upsert_chunks_for_file(rel_path, file_hash, &[])?;
         return Ok(0);
     }
 
-    // Build embedding inputs: prefix + content (matches soc-search's approach where
-    // generate_prefix already produced the prefix string per chunk).
-    let inputs: Vec<String> = chunks
-        .iter()
-        .map(|c| {
-            if c.prefix.is_empty() {
-                c.content.clone()
-            } else {
-                format!("{} {}", c.prefix, c.content)
-            }
-        })
-        .collect();
+    // Embedding inputs are the raw chunk content (per spec: `:Chunk.embedding`
+    // MUST be generated from "no prefix" chunk content). The heading-path
+    // metadata is still surfaced as `:Chunk.prefix` below for downstream
+    // consumers, but it never enters the embedding model's input.
+    let inputs: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
 
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
     for batch in inputs.chunks(batch_size) {
@@ -239,6 +232,7 @@ async fn process_one_file(
     Ok(chunk_inputs.len())
 }
 
+#[derive(Debug)]
 struct FileEntry {
     rel_path: String,
     hash: String,
@@ -249,20 +243,55 @@ fn collect_markdown(root: &Path) -> Result<Vec<FileEntry>> {
     if !root.exists() {
         bail!("markdown root does not exist: {}", root.display());
     }
+    // Compile glob filter from `<root>/.xd-kb.yaml` (or default include + the
+    // engine's hardcoded DEFAULT_EXCLUDES when the file is absent). We still
+    // pre-filter by extension `.md` because (a) the WalkDir traversal can
+    // visit non-markdown files cheaply via this gate without invoking the
+    // glob matcher, and (b) the spec requires DEFAULT_INCLUDE to mean "all
+    // markdown" — extension is the only consistent way to express that.
+    let kb_config = KbConfig::load_for_root(root)?;
+    // Propagate WalkDir errors via a fallible iterator instead of silently
+    // dropping unreadable entries — under `--incremental` a swallowed error
+    // would make a still-present file look "deleted" and trigger spurious
+    // cleanup. The actual filtering / hashing lives in
+    // `collect_markdown_from_entries` so unit tests can inject a synthetic
+    // walk failure to lock the propagation contract.
+    let entries = WalkDir::new(root).into_iter().map(|e| {
+        e.map(|de| de.path().to_path_buf())
+            .with_context(|| format!("walk markdown root {}", root.display()))
+    });
+    collect_markdown_from_entries(root, &kb_config, entries)
+}
+
+/// Per-entry filter + hash + read pipeline. Extracted from `collect_markdown`
+/// so unit tests can drive it with a synthetic `Iterator<Item = Result<PathBuf>>`
+/// (impossible to construct a real `walkdir::Error` without a failing OS call).
+/// Production wires `WalkDir::new(root).into_iter()` into this helper.
+fn collect_markdown_from_entries<I>(
+    root: &Path,
+    kb_config: &KbConfig,
+    entries: I,
+) -> Result<Vec<FileEntry>>
+where
+    I: IntoIterator<Item = Result<std::path::PathBuf>>,
+{
     let mut out = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
+    for path_result in entries {
+        let path = path_result?;
+        if !path.is_file() {
             continue;
         }
-        let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
-        let content = std::fs::read_to_string(path)
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let rel_path = rel.to_string_lossy().replace('\\', "/");
+        if !kb_config.matches(&rel_path) {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)
             .with_context(|| format!("read markdown {}", path.display()))?;
         let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        let rel_path = rel.to_string_lossy().replace('\\', "/");
         out.push(FileEntry {
             rel_path,
             hash,
@@ -332,6 +361,10 @@ mod tests {
         dim: usize,
         // call_count for assertions
         calls: Mutex<usize>,
+        // Verbatim copy of every text passed to `embed`, in arrival order.
+        // Lets tests pin the exact embedding input (e.g. that it does NOT
+        // contain a heading-path prefix duplicated ahead of the content).
+        seen_texts: Mutex<Vec<String>>,
         fail_on: Option<String>,
     }
 
@@ -340,6 +373,7 @@ mod tests {
             Self {
                 dim,
                 calls: Mutex::new(0),
+                seen_texts: Mutex::new(Vec::new()),
                 fail_on: None,
             }
         }
@@ -347,11 +381,15 @@ mod tests {
             Self {
                 dim,
                 calls: Mutex::new(0),
+                seen_texts: Mutex::new(Vec::new()),
                 fail_on: Some(fail_substring.to_string()),
             }
         }
         fn call_count(&self) -> usize {
             *self.calls.lock().unwrap()
+        }
+        fn seen_texts(&self) -> Vec<String> {
+            self.seen_texts.lock().unwrap().clone()
         }
     }
 
@@ -361,6 +399,10 @@ mod tests {
             let fail_on = self.fail_on.clone();
             let texts_owned: Vec<String> = texts.to_vec();
             *self.calls.lock().unwrap() += 1;
+            self.seen_texts
+                .lock()
+                .unwrap()
+                .extend(texts_owned.iter().cloned());
             Box::pin(async move {
                 if let Some(needle) = fail_on
                     && texts_owned.iter().any(|t| t.contains(&needle))
@@ -384,8 +426,9 @@ mod tests {
         std::fs::write(p, body).unwrap();
     }
 
-    // process_file uses category detection — files outside the recognised
-    // category tree return None. Use a path the detector accepts (世界观/).
+    // Two-H2 doc shape used across most index tests. The path prefix `世界观/`
+    // is historical — the engine no longer cares about path; the generic
+    // chunker simply splits on H2 / H3 / whole-file fallback.
     fn worldview_doc(title: &str, body: &str) -> String {
         format!("# {title}\n\n## 概述\n\n{body}\n\n## 细节\n\n更多内容。\n")
     }
@@ -600,14 +643,10 @@ mod tests {
             "v1 should produce indexable chunks: {hits_v1:?}"
         );
 
-        // v2: same path is still recognized (still under 世界观/), but now contains
-        // NO H2/H3 — chunk_by_heading returns []. process_file returns Some([]),
-        // which used to leak: old chunks stayed, hash never advanced.
-        write_md(
-            &root,
-            "世界观/X.md",
-            "# X\n\nplain body with no subheadings.\n",
-        );
+        // v2: same path; content reduced to empty so the generic chunker
+        // produces zero chunks. Without the empty-chunks upsert path the
+        // file would leak: old chunks stayed in storage, hash never advanced.
+        write_md(&root, "世界观/X.md", "");
         run_default(&store, "fake-model", &root, true, &embedder)
             .await
             .unwrap();
@@ -949,12 +988,167 @@ mod tests {
         );
     }
 
-    // Spec scenario "增量索引清理被删除的文件": when `index --incremental` discovers
-    // that a previously-indexed markdown file is gone from disk, it MUST DETACH DELETE
-    // the whole `:FileHash` node — not just `vector_hash`. Otherwise non-vector dims
-    // (graph_hash, etc.) would survive as orphans pointing at a path no longer on disk.
+    // Spec scenario (xd-kb-cli/spec.md:97): `:Chunk.embedding` MUST be
+    // generated from "no prefix" chunk content. Locks against a regression to
+    // `format!("{} {}", c.prefix, c.content)` by directly comparing every
+    // text passed to the embedder against the bare `chunks[i].content` that
+    // `process_file` produced — they MUST be equal, in order.
     #[tokio::test]
-    async fn incremental_delete_drops_whole_filehash_even_with_other_dim() {
+    async fn embedding_input_equals_bare_chunk_content() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        let body = worldview_doc("A", "alpha");
+        write_md(&root, "世界观/A.md", &body);
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::new(TEST_DIM);
+        run_default(&store, "fake-model", &root, false, &embedder)
+            .await
+            .unwrap();
+
+        // Recompute the expected chunks the same way `process_one_file` does.
+        let limits = test_limits();
+        let chunks = crate::markdown::process_file(&body, "世界观/A.md", &limits);
+        let expected: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+        let seen = embedder.seen_texts();
+
+        assert_eq!(
+            seen.len(),
+            expected.len(),
+            "embedder must receive exactly one input per chunk"
+        );
+        for (i, (got, want)) in seen.iter().zip(expected.iter()).enumerate() {
+            // Positive lock: byte-equal to the chunk's bare content.
+            assert_eq!(
+                got, want,
+                "embed input #{i} MUST equal chunks[{i}].content verbatim"
+            );
+            // Defensive negative lock: must NOT carry a duplicated heading
+            // prefix in the form `<prefix> <content>`.
+            let prefix = &chunks[i].prefix;
+            if !prefix.is_empty() {
+                let regression = format!("{prefix} {want}");
+                assert_ne!(
+                    got, &regression,
+                    "embed input #{i} MUST NOT be `<prefix> <content>` form"
+                );
+            }
+        }
+    }
+
+    // R4 finding (test-alignment): WalkDir error propagation MUST abort
+    // indexing rather than silently dropping the entry — a swallowed error
+    // would make a still-present file look "deleted" under --incremental.
+    // Drives `collect_markdown_from_entries` directly with a synthetic
+    // `Err(...)` because constructing a real `walkdir::Error` without a
+    // failing OS call is impractical.
+    #[test]
+    fn collect_markdown_propagates_walk_errors() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".xd-kb.yaml"), "include:\n  - \"**/*.md\"\n").unwrap();
+        let kb_config = KbConfig::load_for_root(root).expect("load .xd-kb.yaml");
+
+        let entries: Vec<Result<std::path::PathBuf>> = vec![
+            Err(anyhow::anyhow!("synthetic walk failure")),
+        ];
+        let res = collect_markdown_from_entries(root, &kb_config, entries);
+        let err = res.expect_err("walk error MUST be propagated");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("synthetic walk failure"),
+            "propagated error must carry the synthetic message verbatim, got: {msg}"
+        );
+    }
+
+    // Spec scenario "无配置文件时收录所有 markdown 但兜底 excludes 生效":
+    // No `.xd-kb.yaml` in root + a `.kb/internal.md` artefact + a `WIKI.md`
+    // index file → only the user-authored `世界观/A.md` makes it into the index.
+    #[tokio::test]
+    async fn collect_markdown_default_excludes_filter_engine_artefacts() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        write_md(&root, "世界观/A.md", &worldview_doc("A", "alpha"));
+        write_md(&root, ".kb/internal.md", "# internal\nbody\n");
+        write_md(&root, "WIKI.md", "# wiki\nbody\n");
+        write_md(&root, "log.md", "# log\nbody\n");
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::new(TEST_DIM);
+        run_default(&store, "fake-model", &root, false, &embedder)
+            .await
+            .unwrap();
+
+        // Only the user-authored doc gets a FileHash; the three artefacts must
+        // be excluded by the engine's hardcoded DEFAULT_EXCLUDES.
+        assert!(
+            store
+                .get_file_hash("世界观/A.md", HashDim::Vector)
+                .unwrap()
+                .is_some(),
+            "user doc must be indexed"
+        );
+        for skipped in [".kb/internal.md", "WIKI.md", "log.md"] {
+            assert!(
+                store
+                    .get_file_hash(skipped, HashDim::Vector)
+                    .unwrap()
+                    .is_none(),
+                "{skipped} must be excluded by DEFAULT_EXCLUDES"
+            );
+        }
+    }
+
+    // Spec scenario "用户 exclude 优先于 include": when `.xd-kb.yaml` carries a
+    // user `exclude`, the matching files must be skipped even though they
+    // satisfy `include: ["**/*.md"]`.
+    #[tokio::test]
+    async fn collect_markdown_user_exclude_filters_files() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(".xd-kb.yaml"),
+            "include:\n  - \"**/*.md\"\nexclude:\n  - \"drafts/**\"\n",
+        )
+        .unwrap();
+        write_md(&root, "published/done.md", &worldview_doc("Done", "done"));
+        write_md(&root, "drafts/wip.md", &worldview_doc("WIP", "wip"));
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::new(TEST_DIM);
+        run_default(&store, "fake-model", &root, false, &embedder)
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .get_file_hash("published/done.md", HashDim::Vector)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_file_hash("drafts/wip.md", HashDim::Vector)
+                .unwrap()
+                .is_none(),
+            "drafts/** must be excluded"
+        );
+    }
+
+    // Spec scenario "增量索引清理被删除的文件——其它 dim 共存时节点保留": when
+    // `index --incremental` discovers that a previously-indexed markdown file
+    // is gone from disk AND the `:FileHash` node also carries non-vector dim
+    // hashes (e.g. `graph_hash` written by an external pipeline), the cleanup
+    // MUST drop only `vector_hash` + the `:Chunk` rows. The node itself and
+    // every other `<dim>_hash` MUST stay intact.
+    #[tokio::test]
+    async fn incremental_delete_preserves_node_when_other_dim_hash_present() {
         let tmp = tempdir().unwrap();
         let db = tmp.path().join("kb.db");
         let root = tmp.path().join("docs");
@@ -967,8 +1161,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate an external pipeline (e.g. graph) writing graph_hash on the same path
-        // via the storage API, bypassing check.rs.
+        // Simulate an external pipeline (e.g. graph) writing graph_hash on the
+        // same path via the storage API, bypassing check.rs.
         store
             .set_file_hash("世界观/Doomed.md", HashDim::Graph, "graph-marker")
             .expect("seed graph_hash");
@@ -987,7 +1181,7 @@ mod tests {
             .await
             .unwrap();
 
-        // (a) Chunks for the deleted file must be gone.
+        // (a) Chunks for the deleted file MUST be gone.
         let qres = store
             .execute_raw("MATCH (c:Chunk {file_path: '世界观/Doomed.md'}) RETURN count(c)")
             .unwrap();
@@ -1000,7 +1194,7 @@ mod tests {
             "all :Chunk nodes for deleted file must be gone"
         );
 
-        // (b) Whole :FileHash node must be gone — including the surviving graph_hash.
+        // (b) :FileHash node MUST still exist — graph dim still carries its hash.
         let qres2 = store
             .execute_raw("MATCH (h:FileHash {path: '世界观/Doomed.md'}) RETURN count(h)")
             .unwrap();
@@ -1009,8 +1203,82 @@ mod tests {
             other => panic!("unexpected count value: {other:?}"),
         };
         assert_eq!(
-            hash_count, 0,
-            ":FileHash node MUST be DETACH DELETEd by incremental cleanup, even when other dim hashes are present"
+            hash_count, 1,
+            ":FileHash node MUST remain when other dim hashes are still present"
         );
+
+        // (c) vector_hash MUST be gone.
+        assert!(
+            store
+                .get_file_hash("世界观/Doomed.md", HashDim::Vector)
+                .unwrap()
+                .is_none(),
+            "vector_hash MUST be REMOVED by per-dim incremental cleanup"
+        );
+
+        // (d) graph_hash MUST be untouched, value identical to seed.
+        assert_eq!(
+            store
+                .get_file_hash("世界观/Doomed.md", HashDim::Graph)
+                .unwrap()
+                .as_deref(),
+            Some("graph-marker"),
+            "graph_hash MUST be preserved verbatim"
+        );
+    }
+
+    // Spec scenario "增量索引清理被删除的文件——本 dim 是最后一个时整节点删除":
+    // when vector is the only dim with a hash on the `:FileHash` node and the
+    // file is removed from disk, the node MUST be DETACH DELETEd entirely.
+    #[tokio::test]
+    async fn incremental_delete_drops_whole_node_when_vector_is_last_dim() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        write_md(&root, "世界观/Solo.md", &worldview_doc("Solo", "y"));
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::new(TEST_DIM);
+        run_default(&store, "fake-model", &root, false, &embedder)
+            .await
+            .unwrap();
+
+        // Precondition: only vector_hash on the node, no other dim seeded.
+        assert!(
+            store
+                .get_file_hash("世界观/Solo.md", HashDim::Vector)
+                .unwrap()
+                .is_some()
+        );
+
+        std::fs::remove_file(root.join("世界观/Solo.md")).unwrap();
+        run_default(&store, "fake-model", &root, true, &embedder)
+            .await
+            .unwrap();
+
+        // Whole :FileHash node MUST be DETACH DELETEd because vector was the
+        // last (and only) non-empty dim.
+        let qres = store
+            .execute_raw("MATCH (h:FileHash {path: '世界观/Solo.md'}) RETURN count(h)")
+            .unwrap();
+        let hash_count = match &qres.rows()[0][0] {
+            grafeo::Value::Int64(n) => *n,
+            other => panic!("unexpected count value: {other:?}"),
+        };
+        assert_eq!(
+            hash_count, 0,
+            ":FileHash node MUST be DETACH DELETEd when vector is the last dim"
+        );
+
+        // And of course no chunk rows remain.
+        let qres2 = store
+            .execute_raw("MATCH (c:Chunk {file_path: '世界观/Solo.md'}) RETURN count(c)")
+            .unwrap();
+        let chunk_count = match &qres2.rows()[0][0] {
+            grafeo::Value::Int64(n) => *n,
+            other => panic!("unexpected count value: {other:?}"),
+        };
+        assert_eq!(chunk_count, 0);
     }
 }

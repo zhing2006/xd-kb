@@ -1,4 +1,8 @@
-use anyhow::{Result, bail};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::Deserialize;
 
 pub const ENV_API_BASE: &str = "XD_KB_API_BASE";
 pub const ENV_API_KEY: &str = "XD_KB_API_KEY";
@@ -74,6 +78,121 @@ where
         bail!("环境变量 {name} 必须为正整数（当前值 {trimmed:?}）");
     }
     Ok(parsed)
+}
+
+// =========================================================================
+// .xd-kb.yaml — per-KB include/exclude glob filtering for `index`.
+// =========================================================================
+
+/// Filename xd-kb looks for in `<markdown-root>` to decide which files to index.
+pub const KB_CONFIG_FILE: &str = ".xd-kb.yaml";
+
+/// Engine-side default excludes — combined (set-union) with user `exclude`
+/// entries. Cannot be cancelled by user `include`. Covers:
+/// - `.kb/**` — engine output dir conventions
+/// - `.xd-kb.yaml` — the config file itself (would otherwise be indexed)
+/// - `WIKI.md` / `log.md` — common KB index/journal artefacts
+pub const DEFAULT_EXCLUDES: &[&str] = &[".kb/**", ".xd-kb.yaml", "WIKI.md", "log.md"];
+
+/// Default include when user provides none — collect every markdown.
+pub const DEFAULT_INCLUDE: &str = "**/*.md";
+
+#[derive(Debug, Default, Deserialize)]
+struct KbConfigRaw {
+    #[serde(default)]
+    include: Option<Vec<String>>,
+    #[serde(default)]
+    exclude: Option<Vec<String>>,
+}
+
+/// Compiled glob filter for a single KB's `index` scope.
+///
+/// Construction is the only place yaml/glob errors surface — once built, calls
+/// to [`KbConfig::matches`] are infallible and cheap. The filter applies to
+/// **relative** paths inside the markdown root with `/` as separator (callers
+/// must normalize before passing in).
+#[derive(Debug)]
+pub struct KbConfig {
+    include: GlobSet,
+    exclude: GlobSet,
+}
+
+impl KbConfig {
+    /// Load filter for `<root>/.xd-kb.yaml`. When the file is absent, returns a
+    /// filter built from `DEFAULT_INCLUDE` + `DEFAULT_EXCLUDES` only.
+    pub fn load_for_root(root: &Path) -> Result<Self> {
+        let yaml_path = root.join(KB_CONFIG_FILE);
+        if yaml_path.exists() {
+            let raw_text = std::fs::read_to_string(&yaml_path)
+                .with_context(|| format!("read {}", yaml_path.display()))?;
+            Self::from_yaml_str(&raw_text, &yaml_path)
+        } else {
+            Self::from_lists(&[DEFAULT_INCLUDE.to_string()], &[], &yaml_path)
+        }
+    }
+
+    fn from_yaml_str(text: &str, source: &Path) -> Result<Self> {
+        let raw: KbConfigRaw = serde_yaml_ng::from_str(text)
+            .map_err(|e| anyhow!("parse {} failed: {e}", source.display()))?;
+        let include = raw
+            .include
+            .unwrap_or_else(|| vec![DEFAULT_INCLUDE.to_string()]);
+        let exclude = raw.exclude.unwrap_or_default();
+        Self::from_lists(&include, &exclude, source)
+    }
+
+    fn from_lists(include: &[String], exclude: &[String], source: &Path) -> Result<Self> {
+        let include = build_glob_set(include, source, "include")?;
+        // Default excludes are merged set-union with user excludes — user
+        // `include` cannot cancel them (spec hard requirement).
+        let mut exclude_patterns: Vec<String> =
+            DEFAULT_EXCLUDES.iter().map(|s| (*s).to_string()).collect();
+        exclude_patterns.extend(exclude.iter().cloned());
+        let exclude = build_glob_set(&exclude_patterns, source, "exclude")?;
+        Ok(Self { include, exclude })
+    }
+
+    /// True iff `rel_path` (forward-slash, relative to the KB root) is included
+    /// AND not excluded. `exclude` always wins.
+    pub fn matches(&self, rel_path: &str) -> bool {
+        if self.exclude.is_match(rel_path) {
+            return false;
+        }
+        self.include.is_match(rel_path)
+    }
+}
+
+fn build_glob_set(patterns: &[String], source: &Path, field: &str) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        let g = Glob::new(p).map_err(|e| {
+            anyhow!(
+                "{} glob pattern {p:?} (from {}) failed to compile: {e}",
+                field,
+                source.display()
+            )
+        })?;
+        builder.add(g);
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow!("{} glob set (from {}) failed to build: {e}", field, source.display()))
+}
+
+/// Walk upwards from `start` until a directory containing `.xd-kb.yaml` is
+/// found; return that directory. Returns `None` if no ancestor (including
+/// `start` itself) carries the file. Used by `check` to infer an implicit
+/// `--root` when the user omitted it.
+pub fn find_xd_kb_yaml_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = start.to_path_buf();
+    loop {
+        if cur.join(KB_CONFIG_FILE).exists() {
+            return Some(cur);
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
 }
 
 // env vars are process-global; tests across modules share the same lock so
@@ -320,6 +439,127 @@ mod tests {
                 assert_eq!(cfg.max_chunk_chars, 2048);
             },
         );
+    }
+
+    // -----------------------------------------------------------------
+    // KbConfig (.xd-kb.yaml) tests — cover the 4 spec scenarios:
+    //   - "无配置文件时收录所有 markdown 但兜底 excludes 生效"
+    //   - "配置驱动收录 + 默认 excludes 不可被 include 抵消"
+    //   - "用户 exclude 优先于 include"
+    //   - "yaml 语法错误时报错"
+    // -----------------------------------------------------------------
+
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    fn yaml_path_in(dir: &Path) -> PathBuf {
+        dir.join(KB_CONFIG_FILE)
+    }
+
+    #[test]
+    fn kb_config_no_yaml_collects_all_md_with_default_excludes() {
+        // Scenario: 无配置文件时收录所有 markdown 但兜底 excludes 生效
+        let tmp = tempdir().unwrap();
+        let cfg = KbConfig::load_for_root(tmp.path()).expect("load with no yaml");
+        // Plain markdown files are included.
+        assert!(cfg.matches("a.md"));
+        assert!(cfg.matches("b.md"));
+        // Default excludes still bite: `.kb/**`, `.xd-kb.yaml`, `WIKI.md`, `log.md`.
+        assert!(!cfg.matches(".kb/internal.md"));
+        assert!(!cfg.matches("WIKI.md"));
+        assert!(!cfg.matches("log.md"));
+        assert!(!cfg.matches(".xd-kb.yaml"));
+    }
+
+    #[test]
+    fn kb_config_user_include_cannot_cancel_default_excludes() {
+        // Scenario: 配置驱动收录 + 默认 excludes 不可被 include 抵消
+        let tmp = tempdir().unwrap();
+        std::fs::write(
+            yaml_path_in(tmp.path()),
+            "include:\n  - \"**/*.md\"\n  - \".kb/**/*.md\"\n",
+        )
+        .unwrap();
+        let cfg = KbConfig::load_for_root(tmp.path()).expect("load yaml");
+        assert!(cfg.matches("notes/x.md"));
+        assert!(
+            !cfg.matches(".kb/y.md"),
+            ".kb/** default exclude must override user include"
+        );
+    }
+
+    #[test]
+    fn kb_config_user_exclude_overrides_include() {
+        // Scenario: 用户 exclude 优先于 include
+        let tmp = tempdir().unwrap();
+        std::fs::write(
+            yaml_path_in(tmp.path()),
+            "include:\n  - \"**/*.md\"\nexclude:\n  - \"drafts/**\"\n",
+        )
+        .unwrap();
+        let cfg = KbConfig::load_for_root(tmp.path()).expect("load yaml");
+        assert!(cfg.matches("published/done.md"));
+        assert!(!cfg.matches("drafts/wip.md"));
+    }
+
+    #[test]
+    fn kb_config_yaml_syntax_error_reports_path_and_error() {
+        // Scenario: yaml 语法错误时报错
+        let tmp = tempdir().unwrap();
+        std::fs::write(
+            yaml_path_in(tmp.path()),
+            "include:\n  - **/*.md\n  not-yaml: [unterminated\n",
+        )
+        .unwrap();
+        let err = KbConfig::load_for_root(tmp.path()).expect_err("syntax error must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(KB_CONFIG_FILE),
+            "error must point at .xd-kb.yaml: {msg}"
+        );
+    }
+
+    #[test]
+    fn kb_config_invalid_glob_pattern_errors() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(
+            yaml_path_in(tmp.path()),
+            "include:\n  - \"[unbalanced\"\n",
+        )
+        .unwrap();
+        let err = KbConfig::load_for_root(tmp.path()).expect_err("bad glob must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(KB_CONFIG_FILE) || msg.contains("[unbalanced"),
+            "error must reference the source or pattern: {msg}"
+        );
+    }
+
+    #[test]
+    fn kb_config_missing_include_defaults_to_all_md() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(yaml_path_in(tmp.path()), "exclude:\n  - \"x.md\"\n").unwrap();
+        let cfg = KbConfig::load_for_root(tmp.path()).expect("load yaml");
+        assert!(cfg.matches("a.md"));
+        assert!(!cfg.matches("x.md"));
+    }
+
+    #[test]
+    fn find_xd_kb_yaml_root_walks_upward_and_returns_none_when_absent() {
+        let tmp = tempdir().unwrap();
+        let inner = tmp.path().join("a/b/c");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(yaml_path_in(tmp.path()), "include:\n  - \"**/*.md\"\n").unwrap();
+        let found = find_xd_kb_yaml_root(&inner).expect("walk should hit tmp root");
+        assert_eq!(found, tmp.path());
+
+        // After removing the marker, lookup must return None.
+        std::fs::remove_file(yaml_path_in(tmp.path())).unwrap();
+        // We cannot guarantee no .xd-kb.yaml exists higher up the real fs, so
+        // we only assert that *if* something was found, it is not under tmp.
+        if let Some(p) = find_xd_kb_yaml_root(&inner) {
+            assert!(!p.starts_with(tmp.path()));
+        }
     }
 
     #[test]
