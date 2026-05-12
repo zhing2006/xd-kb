@@ -233,11 +233,172 @@ impl KbStore {
 
     // ---------- Chunks ----------
 
+    /// Per-batch atomic write: clear old chunks for selected files, then insert
+    /// the batch's chunks — all in a single grafeo session transaction. Does
+    /// NOT touch any `:FileHash` node; FileHash writes are deferred to
+    /// [`Self::set_vector_hashes`] after the whole batch loop completes.
+    ///
+    /// `files_to_clear_first` lists file_paths whose existing `:Chunk` rows
+    /// MUST be `DETACH DELETE`d before this batch's INSERTs run. This is the
+    /// "first batch in this run touches file F" set — caller is responsible
+    /// for not putting F in `files_to_clear_first` on subsequent batches that
+    /// also write to F (otherwise the second batch would wipe what the first
+    /// batch just wrote inside the same run).
+    ///
+    /// Atomicity contract: DELETE and INSERT live in the same transaction, so
+    /// any mid-batch failure rolls back to the state before the batch started.
+    /// "Cleared old but failed to write new" cannot happen.
+    ///
+    /// Dim validation runs BEFORE the transaction opens (same shape as
+    /// [`Self::upsert_chunks_for_file`]); a mismatched-dim chunk fails fast
+    /// with no DB state change. After commit, the vector index is rebuilt.
+    pub fn append_chunks_batch(
+        &self,
+        chunks: &[ChunkInput<'_>],
+        files_to_clear_first: &[&str],
+    ) -> Result<()> {
+        // Pre-flight dim check: all chunks in this batch must share one dim,
+        // and if a vector index already exists, the dim must match it.
+        let chunk_dim = chunks.first().map(|c| c.embedding.len());
+        if let Some(d) = chunk_dim {
+            for (i, ck) in chunks.iter().enumerate() {
+                if ck.embedding.len() != d {
+                    bail!(
+                        "chunk {i} ({}) has embedding dim {} but batch expects dim {d}",
+                        ck.file_path,
+                        ck.embedding.len()
+                    );
+                }
+            }
+            if let Some(existing) = self.peek_existing_chunk_dim()?
+                && existing != d
+            {
+                bail!("batch chunk dim {d} mismatches existing index dim {existing}");
+            }
+        }
+
+        // Empty batch with no clears is a no-op; with clears we still want to
+        // perform them (so a "this run produced 0 chunks for some files" state
+        // is reachable from the new APIs without the caller falling back to a
+        // separate delete path).
+        if chunks.is_empty() && files_to_clear_first.is_empty() {
+            return Ok(());
+        }
+
+        let mut session = self.db.session();
+        session
+            .begin_transaction()
+            .map_err(|e| anyhow!("begin txn for append_chunks_batch: {e}"))?;
+
+        let res = (|| -> Result<()> {
+            // 1. Clear old :Chunk rows for each "first touch this run" file.
+            //    DETACH DELETE only the :Chunk nodes — :FileHash node and any
+            //    other-dim hash properties on it MUST NOT be touched.
+            for file_path in files_to_clear_first {
+                let mut del_params = HashMap::new();
+                del_params.insert("path".to_string(), Value::from(*file_path));
+                session
+                    .execute_with_params(
+                        "MATCH (c:Chunk {file_path: $path}) DETACH DELETE c",
+                        del_params,
+                    )
+                    .map_err(|e| anyhow!("clear old chunks for {file_path}: {e}"))?;
+            }
+
+            // 2. INSERT this batch's chunks. GQL execute path (NOT
+            //    session.create_node) — see upsert_chunks_for_file for the
+            //    grafeo 0.5.41 quirk explanation.
+            for ck in chunks {
+                let mut params = HashMap::new();
+                params.insert("file_path".to_string(), Value::from(ck.file_path));
+                params.insert(
+                    "line_start".to_string(),
+                    Value::Int64(i64::from(ck.line_start)),
+                );
+                params.insert("line_end".to_string(), Value::Int64(i64::from(ck.line_end)));
+                params.insert("content".to_string(), Value::from(ck.content));
+                params.insert(
+                    PROP_EMBEDDING.to_string(),
+                    Value::Vector(Arc::from(ck.embedding.clone())),
+                );
+                let stmt = if let Some(p) = ck.prefix {
+                    params.insert("prefix".to_string(), Value::from(p));
+                    "INSERT (:Chunk {file_path: $file_path, line_start: $line_start, line_end: $line_end, content: $content, prefix: $prefix, embedding: $embedding})"
+                } else {
+                    "INSERT (:Chunk {file_path: $file_path, line_start: $line_start, line_end: $line_end, content: $content, embedding: $embedding})"
+                };
+                session.execute_with_params(stmt, params).map_err(|e| {
+                    anyhow!(
+                        "insert chunk {}:{}-{}: {e}",
+                        ck.file_path,
+                        ck.line_start,
+                        ck.line_end
+                    )
+                })?;
+            }
+            Ok(())
+        })();
+
+        match res {
+            Ok(()) => session
+                .commit()
+                .map_err(|e| anyhow!("commit append_chunks_batch: {e}"))?,
+            Err(e) => {
+                let _ = session.rollback();
+                return Err(e);
+            }
+        }
+
+        // Rebuild the vector index so freshly-inserted chunks are visible to
+        // CALL grafeo.search.vector. Same rationale as upsert_chunks_for_file.
+        if let Some(d) = chunk_dim {
+            self.ensure_chunk_vector_index(d)?;
+        }
+        Ok(())
+    }
+
+    /// Bulk-write `vector_hash` for many file_paths in one transaction. Other
+    /// `<dim>_hash` properties on each `:FileHash` node MUST stay intact.
+    ///
+    /// Called from the FileHash phase of the new index pipeline, after every
+    /// batch has finished, for the subset of files whose chunks all landed in
+    /// successful batches. No-op for an empty input list.
+    pub fn set_vector_hashes(&self, file_hashes: &[(&str, &str)]) -> Result<()> {
+        if file_hashes.is_empty() {
+            return Ok(());
+        }
+        let mut session = self.db.session();
+        session
+            .begin_transaction()
+            .map_err(|e| anyhow!("begin txn for set_vector_hashes: {e}"))?;
+        let res = (|| -> Result<()> {
+            for (path, hash) in file_hashes {
+                upsert_file_hash_in_session(&session, path, HashDim::Vector, hash)?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => session
+                .commit()
+                .map_err(|e| anyhow!("commit set_vector_hashes: {e}")),
+            Err(e) => {
+                let _ = session.rollback();
+                Err(e)
+            }
+        }
+    }
+
     /// Replace all chunks for `file_path` and refresh its FileHash, atomically.
     ///
     /// Dim validation runs BEFORE the transaction opens — if any chunk has a vector dim
     /// that doesn't match the others, the call returns Err and no DB state changes.
     /// After commit, the vector index is rebuilt so subsequent `search` sees the new chunks.
+    ///
+    /// Retained as a public API per the spec — currently only the cfg(test)
+    /// suites of `storage.rs` and `query.rs` exercise it; the production
+    /// index pipeline routes everything through [`Self::append_chunks_batch`]
+    /// + [`Self::set_vector_hashes`] for per-batch failure isolation.
+    #[allow(dead_code)]
     pub fn upsert_chunks_for_file(
         &self,
         file_path: &str,
@@ -353,10 +514,13 @@ impl KbStore {
     /// intact when present — they belong to other pipelines and are owned
     /// exclusively by `check --type <dim> --mark`.
     ///
-    /// This is the path `index --incremental` takes when a previously-indexed
-    /// markdown file is missing from disk; using `delete_file_completely`
-    /// here would unconditionally orphan other dims' hashes, which violates
-    /// the per-dim FileHash contract documented in storage.rs:1-13.
+    /// **Incremental delete path only** — invoked when a previously-indexed
+    /// markdown file is missing from disk. The new index pipeline's normal
+    /// write path goes through [`Self::append_chunks_batch`] +
+    /// [`Self::set_vector_hashes`]; this entry point exists exclusively for
+    /// the disk-missing branch where we need a per-dim "scrub vector data
+    /// without touching other dims" semantic that
+    /// `delete_file_completely` would violate.
     pub fn delete_vector_dim_for_file(&self, file_path: &str) -> Result<()> {
         let mut session = self.db.session();
         session
@@ -1200,5 +1364,234 @@ mod tests {
     #[allow(dead_code)]
     fn _hm_marker() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    // =====================================================================
+    // append_chunks_batch + set_vector_hashes — task 1.3 coverage.
+    // Test names are BDD-style ("given/when/then" in name + comment) per the
+    // project test convention (xd-spec change xd-kb-batch-indexing).
+    // =====================================================================
+
+    fn count_chunks(store: &KbStore, file_path: &str) -> i64 {
+        let session = store.db.session();
+        let mut params = HashMap::new();
+        params.insert("path".to_string(), Value::from(file_path));
+        let res = session
+            .execute_with_params("MATCH (c:Chunk {file_path: $path}) RETURN count(c)", params)
+            .unwrap();
+        match &res.rows()[0][0] {
+            Value::Int64(n) => *n,
+            other => panic!("unexpected count value: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_chunks_batch_with_empty_input_and_no_clears_is_noop() {
+        let store = KbStore::open_in_memory();
+        store.ensure_chunk_vector_index(4).unwrap();
+        // Seed something so we can assert it's untouched.
+        store
+            .upsert_chunks_for_file(
+                "a.md",
+                "h",
+                &[mk_chunk("a.md", 1, 1, "x", embed(&[1.0, 0.0, 0.0]))],
+            )
+            .unwrap();
+        store
+            .append_chunks_batch(&[], &[])
+            .expect("noop must succeed");
+        assert_eq!(count_chunks(&store, "a.md"), 1, "seed chunk must remain");
+    }
+
+    #[test]
+    fn append_chunks_batch_clears_only_listed_files() {
+        // Given two pre-existing files A and B, when append_chunks_batch is
+        // called with files_to_clear_first=[A] and an empty chunk list, then
+        // A's chunks are wiped while B's are untouched.
+        let store = KbStore::open_in_memory();
+        store.ensure_chunk_vector_index(4).unwrap();
+        store
+            .upsert_chunks_for_file(
+                "a.md",
+                "ha",
+                &[
+                    mk_chunk("a.md", 1, 1, "a1", embed(&[1.0, 0.0, 0.0])),
+                    mk_chunk("a.md", 2, 2, "a2", embed(&[0.0, 1.0, 0.0])),
+                ],
+            )
+            .unwrap();
+        store
+            .upsert_chunks_for_file(
+                "b.md",
+                "hb",
+                &[mk_chunk("b.md", 1, 1, "b1", embed(&[0.5, 0.5, 0.0]))],
+            )
+            .unwrap();
+
+        store
+            .append_chunks_batch(&[], &["a.md"])
+            .expect("clear-only call must succeed");
+
+        assert_eq!(count_chunks(&store, "a.md"), 0, "A chunks must be cleared");
+        assert_eq!(count_chunks(&store, "b.md"), 1, "B chunks MUST stay");
+        // FileHash for A must remain (clears MUST NOT touch FileHash).
+        assert_eq!(
+            store
+                .get_file_hash("a.md", HashDim::Vector)
+                .unwrap()
+                .as_deref(),
+            Some("ha"),
+            "A's vector_hash MUST stay intact — clears only touch :Chunk"
+        );
+    }
+
+    #[test]
+    fn append_chunks_batch_clears_first_then_inserts_in_one_txn() {
+        // The classic "first batch in this run touches file A" case.
+        let store = KbStore::open_in_memory();
+        store.ensure_chunk_vector_index(4).unwrap();
+        store
+            .upsert_chunks_for_file(
+                "a.md",
+                "stale",
+                &[
+                    mk_chunk("a.md", 1, 1, "old1", embed(&[0.1, 0.0, 0.0])),
+                    mk_chunk("a.md", 2, 2, "old2", embed(&[0.2, 0.0, 0.0])),
+                ],
+            )
+            .unwrap();
+
+        let new_batch = vec![
+            mk_chunk("a.md", 10, 11, "new1", embed(&[1.0, 0.0, 0.0])),
+            mk_chunk("a.md", 12, 13, "new2", embed(&[0.0, 1.0, 0.0])),
+        ];
+        store
+            .append_chunks_batch(&new_batch, &["a.md"])
+            .expect("clear+insert batch must succeed");
+
+        assert_eq!(count_chunks(&store, "a.md"), 2);
+        let hits = store.search(&embed(&[1.0, 0.0, 0.0]), 10).unwrap();
+        let bodies: Vec<_> = hits.iter().map(|h| h.content.clone()).collect();
+        assert!(bodies.contains(&"new1".to_string()), "got {bodies:?}");
+        assert!(
+            !bodies.contains(&"old1".to_string()),
+            "stale chunk leaked: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn append_chunks_batch_clears_nonexistent_file_path_is_idempotent() {
+        // files_to_clear_first may include paths with no existing chunks
+        // (e.g. first-ever indexing). MUST NOT error; MUST leave DB clean.
+        let store = KbStore::open_in_memory();
+        store.ensure_chunk_vector_index(4).unwrap();
+        let batch = vec![mk_chunk("fresh.md", 1, 1, "first", embed(&[1.0, 0.0, 0.0]))];
+        store
+            .append_chunks_batch(&batch, &["fresh.md"])
+            .expect("clearing a brand-new file_path must be a no-op");
+        assert_eq!(count_chunks(&store, "fresh.md"), 1);
+    }
+
+    #[test]
+    fn append_chunks_batch_aggregates_across_multiple_files() {
+        // Cross-file batch: a single batch may write chunks belonging to
+        // several files at once. After commit each file's chunks must be
+        // queryable. This is the spec scenario "跨文件 batch 聚合".
+        let store = KbStore::open_in_memory();
+        store.ensure_chunk_vector_index(4).unwrap();
+        let batch = vec![
+            mk_chunk("a.md", 1, 1, "a1", embed(&[1.0, 0.0, 0.0])),
+            mk_chunk("a.md", 2, 2, "a2", embed(&[0.9, 0.1, 0.0])),
+            mk_chunk("b.md", 1, 1, "b1", embed(&[0.0, 1.0, 0.0])),
+        ];
+        store
+            .append_chunks_batch(&batch, &["a.md", "b.md"])
+            .expect("cross-file batch must succeed");
+        assert_eq!(count_chunks(&store, "a.md"), 2);
+        assert_eq!(count_chunks(&store, "b.md"), 1);
+    }
+
+    #[test]
+    fn append_chunks_batch_rolls_back_on_insert_failure_keeps_old_chunks() {
+        // Atomicity: if INSERT fails (here forced by a wrong-dim chunk), the
+        // pre-batch DELETE on cleared files MUST also roll back. Old chunks
+        // must reappear.
+        let store = KbStore::open_in_memory();
+        store.ensure_chunk_vector_index(4).unwrap();
+        store
+            .upsert_chunks_for_file(
+                "a.md",
+                "h",
+                &[mk_chunk("a.md", 1, 1, "keep-me", embed(&[1.0, 0.0, 0.0]))],
+            )
+            .unwrap();
+        // Wrong-dim vector → fails pre-flight check (no DB state change).
+        let bad = vec![mk_chunk("a.md", 2, 2, "bad", vec![1.0, 0.0])];
+        let res = store.append_chunks_batch(&bad, &["a.md"]);
+        assert!(res.is_err(), "wrong-dim batch MUST fail");
+        // Pre-flight rejection means we never even opened the txn; the seed
+        // chunk MUST still be present.
+        assert_eq!(
+            count_chunks(&store, "a.md"),
+            1,
+            "atomicity: cleared chunk MUST be restored on failure"
+        );
+        let hits = store.search(&embed(&[1.0, 0.0, 0.0]), 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.content == "keep-me"),
+            "seed chunk MUST still be searchable"
+        );
+    }
+
+    #[test]
+    fn set_vector_hashes_writes_each_pair_and_preserves_other_dims() {
+        let store = KbStore::open_in_memory();
+        // Seed an unrelated dim on one of the paths to confirm it's preserved.
+        store.set_file_hash("a.md", HashDim::Graph, "ga").unwrap();
+
+        store
+            .set_vector_hashes(&[("a.md", "v-a"), ("b.md", "v-b")])
+            .expect("bulk hash write must succeed");
+
+        assert_eq!(
+            store
+                .get_file_hash("a.md", HashDim::Vector)
+                .unwrap()
+                .as_deref(),
+            Some("v-a")
+        );
+        assert_eq!(
+            store
+                .get_file_hash("b.md", HashDim::Vector)
+                .unwrap()
+                .as_deref(),
+            Some("v-b")
+        );
+        assert_eq!(
+            store
+                .get_file_hash("a.md", HashDim::Graph)
+                .unwrap()
+                .as_deref(),
+            Some("ga"),
+            "graph_hash MUST survive set_vector_hashes"
+        );
+    }
+
+    #[test]
+    fn set_vector_hashes_with_empty_list_is_noop() {
+        let store = KbStore::open_in_memory();
+        store
+            .set_vector_hashes(&[])
+            .expect("empty list must be a no-op");
+        // Confirm no FileHash node was conjured.
+        let session = store.db.session();
+        let res = session
+            .execute("MATCH (h:FileHash) RETURN count(h)")
+            .unwrap();
+        let n = match &res.rows()[0][0] {
+            Value::Int64(n) => *n,
+            other => panic!("unexpected count: {other:?}"),
+        };
+        assert_eq!(n, 0);
     }
 }

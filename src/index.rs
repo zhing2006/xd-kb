@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -35,8 +35,54 @@ struct IndexStats {
     indexed: usize,
     unchanged: usize,
     deleted: usize,
-    failed: usize,
     empty: usize,
+    batches_failed: usize,
+    chunks_failed: usize,
+    failed_files: HashSet<String>,
+}
+
+/// One chunk produced by `collect_phase`, tagged with the file it came from
+/// and that file's content hash. The chunking + embedding + storage layers all
+/// see chunks individually, but the per-batch failure-isolation contract needs
+/// to know "which file owns this chunk" so failed batches can flag the
+/// affected files for the FileHash phase.
+/// One chunk pointed at its owning file. The hash itself is held in
+/// `CollectResult::file_hashes` rather than inlined per chunk — N chunks of
+/// the same file would otherwise carry N copies of the same blake3 string.
+struct CollectedChunk {
+    file_path: String,
+    chunk: Chunk,
+}
+
+struct CollectResult {
+    /// Flat global chunk list, batched in `embed_and_write_phase` by batch_size.
+    global_chunks: Vec<CollectedChunk>,
+    /// `file_path` → number of chunks this file contributed to `global_chunks`.
+    /// Includes "empty modified" files at value 0 — they still need `vector_hash`
+    /// rewritten because their content hash changed (e.g. file emptied).
+    chunks_per_file: HashMap<String, usize>,
+    /// `file_path` → blake3 of file content; passed straight to
+    /// `set_vector_hashes` in `mark_completed_files_phase`.
+    file_hashes: HashMap<String, String>,
+    /// Count of files skipped because `:FileHash.vector_hash` already matches
+    /// disk content (incremental mode).
+    unchanged: usize,
+    /// Set of `file_path`s present on disk this run (for incremental cleanup
+    /// of stored files no longer on disk).
+    on_disk: HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct EmbedWriteResult {
+    batches_failed: usize,
+    chunks_failed: usize,
+    /// `file_path` → number of chunks successfully written this run. Compared
+    /// against `CollectResult::chunks_per_file` in the FileHash phase to decide
+    /// whether `vector_hash` may be written.
+    chunks_succeeded_per_file: HashMap<String, usize>,
+    /// Files that had at least one chunk in a failed batch. Reported in the
+    /// stderr failure summary so the user knows which files to re-index.
+    failed_files: HashSet<String>,
 }
 
 pub async fn run(
@@ -90,7 +136,178 @@ async fn run_with_embedder(
         bail!("batch_size must be >= 1");
     }
 
-    // 1. IndexConfig: write on first run, validate on subsequent.
+    // Phase 1 — Collect: walk disk, validate IndexConfig, drop unchanged
+    // files (incremental), flatten everything into one global chunk list.
+    let entries = collect_markdown(root)?;
+    let collect = collect_phase(
+        entries,
+        store,
+        incremental,
+        model,
+        dim,
+        max_chunk_chars,
+        limits,
+    )?;
+
+    // Progress: announce the workload before touching the embedding API.
+    // N counts files passing through (indexed + empty modified), not chunks
+    // alone — the spec scenario "Processing 0 files / 0 chunks" expects the
+    // 0/0 case to be reachable when incremental skips everything.
+    let processing_files = collect.chunks_per_file.len();
+    eprintln!(
+        "{}",
+        fmt_processing(processing_files, collect.global_chunks.len())
+    );
+
+    // Pre-clear "empty modified" files (file modified, content shrank to zero
+    // chunks). They never enter Embed & Write so we clear here in their own
+    // tiny transaction. Empty list → no-op.
+    let empty_clear_owned: Vec<String> = collect
+        .chunks_per_file
+        .iter()
+        .filter(|(_, c)| **c == 0)
+        .map(|(p, _)| p.clone())
+        .collect();
+    if !empty_clear_owned.is_empty() {
+        let empty_clear: Vec<&str> = empty_clear_owned.iter().map(|s| s.as_str()).collect();
+        store
+            .append_chunks_batch(&[], &empty_clear)
+            .with_context(|| "pre-clear empty-modified files")?;
+    }
+
+    // Phase 2 — Embed & Write per batch.
+    let ew = embed_and_write_phase(&collect.global_chunks, embedder, store, batch_size).await;
+
+    // Phase 3 — FileHash mark: write vector_hash only for files whose chunks
+    // all landed.
+    mark_completed_files_phase(&collect, &ew, store)?;
+
+    // Incremental cleanup: drop vector data for files no longer on disk.
+    let mut deleted = 0usize;
+    let mut delete_failures: Vec<String> = Vec::new();
+    if incremental {
+        let stored_paths = store.list_file_paths()?;
+        for p in stored_paths {
+            if !collect.on_disk.contains(&p) {
+                if let Err(e) = store.delete_vector_dim_for_file(&p) {
+                    eprintln!("[fail-delete] {p}: {e}");
+                    delete_failures.push(p);
+                } else {
+                    deleted += 1;
+                }
+            }
+        }
+    }
+
+    // Tally final stats. `indexed` = files with >0 chunks where every chunk
+    // succeeded. `empty` = modified files that produced 0 chunks (their
+    // vector_hash was just rewritten by Phase 3).
+    let mut indexed = 0usize;
+    let mut empty = 0usize;
+    for (file, &pending) in &collect.chunks_per_file {
+        if pending == 0 {
+            empty += 1;
+        } else {
+            let succeeded = ew.chunks_succeeded_per_file.get(file).copied().unwrap_or(0);
+            if succeeded == pending {
+                indexed += 1;
+            }
+        }
+    }
+
+    let stats = IndexStats {
+        indexed,
+        unchanged: collect.unchanged,
+        deleted,
+        empty,
+        batches_failed: ew.batches_failed,
+        chunks_failed: ew.chunks_failed,
+        failed_files: ew.failed_files,
+    };
+
+    // Final stdout line — single line, machine-parseable, format pinned by
+    // spec scenario "进度输出格式".
+    println!("{}", fmt_index_complete(&stats));
+
+    if stats.batches_failed > 0 || !delete_failures.is_empty() {
+        // Stderr failure summary, separate from stdout so scripts that pipe
+        // stdout to a parser still see the human signal.
+        eprintln!("{}", fmt_index_failed(&stats));
+        if stats.batches_failed > 0 {
+            bail!(
+                "{} batch(es) failed; see [batch-fail] entries above",
+                stats.batches_failed
+            );
+        }
+        bail!(
+            "{} file(s) failed to delete; see [fail-delete] entries above",
+            delete_failures.len()
+        );
+    }
+    Ok(())
+}
+
+// ---------- progress / status formatters ----------
+//
+// Centralised here so the spec-pinned strings live in one place and unit tests
+// can assert exact output without redirecting stderr.
+
+fn fmt_processing(n_files: usize, n_chunks: usize) -> String {
+    format!("Processing {n_files} files / {n_chunks} chunks")
+}
+
+fn fmt_embedding_batch(i: usize, total: usize) -> String {
+    format!("Embedding batch {i}/{total}")
+}
+
+fn fmt_batch_fail(i: usize, error: &str, files: &HashSet<String>) -> String {
+    // Sort file paths so the output is deterministic across HashSet iteration
+    // orders — important both for the snapshot test and for users diffing run
+    // logs across re-runs.
+    let mut sorted: Vec<&String> = files.iter().collect();
+    sorted.sort();
+    let files_csv = sorted
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[batch-fail] batch {i}: {error} (files: {files_csv})")
+}
+
+fn fmt_index_complete(stats: &IndexStats) -> String {
+    format!(
+        "Index complete: indexed={} unchanged={} deleted={} empty={} batches_failed={} chunks_failed={}",
+        stats.indexed,
+        stats.unchanged,
+        stats.deleted,
+        stats.empty,
+        stats.batches_failed,
+        stats.chunks_failed
+    )
+}
+
+fn fmt_index_failed(stats: &IndexStats) -> String {
+    format!(
+        "Index failed: batches_failed={} affected_files={}",
+        stats.batches_failed,
+        stats.failed_files.len()
+    )
+}
+
+/// Phase 1: validate IndexConfig, walk every entry, filter unchanged files
+/// when `incremental`, and flatten chunks into one global list.
+#[allow(clippy::too_many_arguments)]
+fn collect_phase(
+    entries: Vec<FileEntry>,
+    store: &KbStore,
+    incremental: bool,
+    model: &str,
+    dim: usize,
+    max_chunk_chars: u32,
+    limits: &ChunkLimits,
+) -> Result<CollectResult> {
+    // IndexConfig: write on first run, validate on subsequent. Identical
+    // semantics to the pre-refactor behaviour — only the location moved.
     match store.read_index_config()? {
         Some(existing)
             if existing.model == model
@@ -108,128 +325,185 @@ async fn run_with_embedder(
         None => store.write_index_config(model, dim, max_chunk_chars)?,
     }
 
-    // 2. Enumerate disk markdown files
-    let entries = collect_markdown(root)?;
     let on_disk: HashSet<String> = entries.iter().map(|e| e.rel_path.clone()).collect();
+    let mut global_chunks: Vec<CollectedChunk> = Vec::new();
+    let mut chunks_per_file: HashMap<String, usize> = HashMap::new();
+    let mut file_hashes: HashMap<String, String> = HashMap::new();
+    let mut unchanged = 0usize;
 
-    let mut stats = IndexStats::default();
+    for entry in entries {
+        let FileEntry {
+            rel_path,
+            hash,
+            content,
+        } = entry;
 
-    // 3. Per-file processing (each upsert is its own grafeo transaction)
-    for FileEntry {
-        rel_path,
-        hash,
-        content,
-    } in &entries
-    {
         if incremental
-            && let Some(stored) = store.get_file_hash(rel_path, HashDim::Vector)?
-            && &stored == hash
+            && let Some(stored) = store.get_file_hash(&rel_path, HashDim::Vector)?
+            && stored == hash
         {
-            stats.unchanged += 1;
+            unchanged += 1;
             continue;
         }
 
-        match process_one_file(store, rel_path, hash, content, embedder, batch_size, limits).await {
-            Ok(0) => {
-                stats.empty += 1;
-            }
-            Ok(_) => {
-                stats.indexed += 1;
-            }
-            Err(e) => {
-                eprintln!("[fail] {rel_path}: {e}");
-                stats.failed += 1;
-            }
+        let chunks = collect_chunks_for_file(&content, &rel_path, limits);
+        chunks_per_file.insert(rel_path.clone(), chunks.len());
+        file_hashes.insert(rel_path.clone(), hash);
+        for chunk in chunks {
+            global_chunks.push(CollectedChunk {
+                file_path: rel_path.clone(),
+                chunk,
+            });
         }
     }
 
-    // 4. Cleanup files removed from disk (incremental mode only).
-    if incremental {
-        let stored_paths = store.list_file_paths()?;
-        for p in stored_paths {
-            if !on_disk.contains(&p) {
-                // Per-dim cleanup: only the vector pipeline's data
-                // (`:Chunk` rows + `vector_hash` property) is removed; other
-                // dims' hashes on the same `:FileHash` node stay intact.
-                if let Err(e) = store.delete_vector_dim_for_file(&p) {
-                    eprintln!("[fail-delete] {p}: {e}");
-                    stats.failed += 1;
-                } else {
-                    stats.deleted += 1;
-                }
-            }
-        }
-    }
-
-    println!(
-        "Index complete: indexed={} unchanged={} deleted={} empty={} failed={}",
-        stats.indexed, stats.unchanged, stats.deleted, stats.empty, stats.failed
-    );
-    if stats.failed > 0 {
-        bail!("{} file(s) failed; see [fail] entries above", stats.failed);
-    }
-    Ok(())
+    Ok(CollectResult {
+        global_chunks,
+        chunks_per_file,
+        file_hashes,
+        unchanged,
+        on_disk,
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn process_one_file(
-    store: &KbStore,
-    rel_path: &str,
-    file_hash: &str,
-    content: &str,
+/// Pure chunking helper extracted from the old `process_one_file`. Takes file
+/// content and produces the chunks that will be embedded — no embedding, no
+/// grafeo writes. Lets `collect_phase` flatten chunks before the embedding
+/// stage knows anything about file boundaries.
+fn collect_chunks_for_file(content: &str, rel_path: &str, limits: &ChunkLimits) -> Vec<Chunk> {
+    process_file(content, rel_path, limits)
+}
+
+/// Phase 2: per-batch embed + write. Each batch is its own grafeo session
+/// transaction. A batch failure is captured into `EmbedWriteResult` and the
+/// loop advances to the next batch — failure does NOT short-circuit run.
+async fn embed_and_write_phase(
+    global_chunks: &[CollectedChunk],
     embedder: &dyn Embedder,
+    store: &KbStore,
     batch_size: usize,
-    limits: &ChunkLimits,
-) -> Result<usize> {
-    let chunks: Vec<Chunk> = process_file(content, rel_path, limits);
-    // Empty chunk list (e.g. an empty markdown file): still treat as a valid upsert
-    // with zero chunks so storage deletes any prior chunks AND refreshes the
-    // FileHash atomically. Without this, a file that previously produced chunks
-    // but no longer does would leave stale chunks in grafeo and incremental mode
-    // would re-process it every run (because the hash never advances).
-    if chunks.is_empty() {
-        store.upsert_chunks_for_file(rel_path, file_hash, &[])?;
-        return Ok(0);
+) -> EmbedWriteResult {
+    let mut result = EmbedWriteResult::default();
+
+    if global_chunks.is_empty() {
+        return result;
     }
 
-    // Embedding inputs are the raw chunk content (per spec: `:Chunk.embedding`
-    // MUST be generated from "no prefix" chunk content). The heading-path
-    // metadata is still surfaced as `:Chunk.prefix` below for downstream
-    // consumers, but it never enters the embedding model's input.
-    let inputs: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    let total_batches = global_chunks.len().div_ceil(batch_size);
+    // Tracks "this run has already COMMITTED a clear for file F". Updated only
+    // after `append_chunks_batch` succeeds, so a failed batch never marks F as
+    // cleared. The next batch that touches F will then still issue the
+    // `files_to_clear_first` for F, guaranteeing the first SUCCESSFUL batch
+    // for any file removes its stale `:Chunk` rows in the same transaction.
+    let mut cleared_files: HashSet<String> = HashSet::new();
 
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
-    for batch in inputs.chunks(batch_size) {
-        let v = embedder.embed(batch).await?;
-        if v.len() != batch.len() {
-            bail!(
-                "embedding count mismatch in batch (expected {}, got {})",
-                batch.len(),
-                v.len()
-            );
+    for (idx, batch_slice) in global_chunks.chunks(batch_size).enumerate() {
+        let i = idx + 1;
+        eprintln!("{}", fmt_embedding_batch(i, total_batches));
+
+        // Decide which files in this batch need their stale chunks cleared.
+        // Use a per-batch dedup set so the same file appearing twice within
+        // the same batch is only listed once.
+        let mut to_clear_owned: Vec<String> = Vec::new();
+        let mut batch_dedup: HashSet<&str> = HashSet::new();
+        for cc in batch_slice {
+            if !cleared_files.contains(&cc.file_path) && batch_dedup.insert(cc.file_path.as_str()) {
+                to_clear_owned.push(cc.file_path.clone());
+            }
         }
-        vectors.extend(v);
+
+        let inputs: Vec<String> = batch_slice
+            .iter()
+            .map(|cc| cc.chunk.content.clone())
+            .collect();
+
+        let vectors = match embedder.embed(&inputs).await {
+            Ok(v) => v,
+            Err(e) => {
+                let files: HashSet<String> =
+                    batch_slice.iter().map(|cc| cc.file_path.clone()).collect();
+                eprintln!("{}", fmt_batch_fail(i, &e.to_string(), &files));
+                result.batches_failed += 1;
+                result.chunks_failed += batch_slice.len();
+                result.failed_files.extend(files);
+                continue;
+            }
+        };
+
+        if vectors.len() != batch_slice.len() {
+            let files: HashSet<String> =
+                batch_slice.iter().map(|cc| cc.file_path.clone()).collect();
+            let mismatch_msg = format!(
+                "embedding count mismatch (expected {}, got {})",
+                batch_slice.len(),
+                vectors.len()
+            );
+            eprintln!("{}", fmt_batch_fail(i, &mismatch_msg, &files));
+            result.batches_failed += 1;
+            result.chunks_failed += batch_slice.len();
+            result.failed_files.extend(files);
+            continue;
+        }
+
+        let chunk_inputs: Vec<ChunkInput<'_>> = batch_slice
+            .iter()
+            .zip(vectors.iter())
+            .map(|(cc, v)| ChunkInput {
+                file_path: cc.file_path.as_str(),
+                line_start: u32::try_from(cc.chunk.line_start).unwrap_or(u32::MAX),
+                line_end: u32::try_from(cc.chunk.line_end).unwrap_or(u32::MAX),
+                content: cc.chunk.content.as_str(),
+                prefix: if cc.chunk.prefix.is_empty() {
+                    None
+                } else {
+                    Some(cc.chunk.prefix.as_str())
+                },
+                embedding: v.clone(),
+            })
+            .collect();
+
+        let to_clear: Vec<&str> = to_clear_owned.iter().map(|s| s.as_str()).collect();
+        if let Err(e) = store.append_chunks_batch(&chunk_inputs, &to_clear) {
+            let files: HashSet<String> =
+                batch_slice.iter().map(|cc| cc.file_path.clone()).collect();
+            eprintln!("{}", fmt_batch_fail(i, &e.to_string(), &files));
+            result.batches_failed += 1;
+            result.chunks_failed += batch_slice.len();
+            result.failed_files.extend(files);
+            continue;
+        }
+
+        // Commit-time mark: only after a successful DELETE+INSERT do we
+        // promise that subsequent batches must NOT re-clear these files.
+        cleared_files.extend(to_clear_owned);
+
+        for cc in batch_slice {
+            *result
+                .chunks_succeeded_per_file
+                .entry(cc.file_path.clone())
+                .or_insert(0) += 1;
+        }
     }
 
-    let chunk_inputs: Vec<ChunkInput<'_>> = chunks
-        .iter()
-        .zip(vectors.iter())
-        .map(|(c, v)| ChunkInput {
-            file_path: rel_path,
-            line_start: u32::try_from(c.line_start).unwrap_or(u32::MAX),
-            line_end: u32::try_from(c.line_end).unwrap_or(u32::MAX),
-            content: &c.content,
-            prefix: if c.prefix.is_empty() {
-                None
-            } else {
-                Some(c.prefix.as_str())
-            },
-            embedding: v.clone(),
-        })
-        .collect();
+    result
+}
 
-    store.upsert_chunks_for_file(rel_path, file_hash, &chunk_inputs)?;
-    Ok(chunk_inputs.len())
+/// Phase 3: write `vector_hash` only for files where every chunk landed.
+fn mark_completed_files_phase(
+    collect: &CollectResult,
+    ew: &EmbedWriteResult,
+    store: &KbStore,
+) -> Result<()> {
+    let mut hashes: Vec<(&str, &str)> = Vec::new();
+    for (file, &pending) in &collect.chunks_per_file {
+        let succeeded = ew.chunks_succeeded_per_file.get(file).copied().unwrap_or(0);
+        if succeeded == pending
+            && let Some(h) = collect.file_hashes.get(file)
+        {
+            hashes.push((file.as_str(), h.as_str()));
+        }
+    }
+    store.set_vector_hashes(&hashes)
 }
 
 #[derive(Debug)]
@@ -469,7 +743,8 @@ mod tests {
         assert_eq!(cfg.dim, TEST_DIM);
         assert_eq!(cfg.max_chunk_chars, TEST_MAX_CHUNK_CHARS);
 
-        // FileHash for both files present
+        // FileHash for both files present — and per the new contract, written
+        // ONLY because every chunk landed (no batch failed).
         assert!(
             store
                 .get_file_hash("世界观/A.md", HashDim::Vector)
@@ -549,8 +824,13 @@ mod tests {
         );
     }
 
+    /// Spec scenario: 单 batch 失败不影响其它 batch.
+    /// File A is "good" (1 chunk via worldview_doc → 2 H2s actually);
+    /// file B contains the MAGIC_FAIL token so any batch carrying its chunks
+    /// fails. Verify A's vector_hash IS written (because none of A's batches
+    /// failed) and B's vector_hash is NOT (its sole batch failed).
     #[tokio::test]
-    async fn embedding_failure_rolls_back_just_one_file() {
+    async fn batch_failure_does_not_affect_other_batches() {
         let tmp = tempdir().unwrap();
         let db = tmp.path().join("kb.db");
         let root = tmp.path().join("docs");
@@ -565,22 +845,369 @@ mod tests {
         let store = KbStore::open(&db).unwrap();
         let embedder = FakeEmbedder::failing(TEST_DIM, "MAGIC_FAIL");
 
-        // run returns Err because some files failed, but Good.md should still be indexed
-        let _ = run_default(&store, "fake-model", &root, false, &embedder).await;
+        // batch_size=1 forces every chunk into its own batch — Bad's chunks
+        // fail in their own batches without dragging Good down.
+        let limits = test_limits();
+        let res = run_with_embedder(
+            &store,
+            "fake-model",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            false,
+            1,
+            &limits,
+            &embedder,
+        )
+        .await;
+        assert!(res.is_err(), "run MUST exit non-zero when any batch fails");
 
         assert!(
             store
                 .get_file_hash("世界观/Good.md", HashDim::Vector)
                 .unwrap()
                 .is_some(),
-            "successful file MUST be indexed despite sibling failure"
+            "Good.md vector_hash MUST be written — none of its batches failed"
         );
         assert!(
             store
                 .get_file_hash("世界观/Bad.md", HashDim::Vector)
                 .unwrap()
                 .is_none(),
-            "failed file MUST NOT leave any FileHash record (single-file rollback)"
+            "Bad.md vector_hash MUST NOT be written — its batch failed"
+        );
+    }
+
+    /// Spec scenario: FileHash 仅在文件全部 chunks 成功后写入.
+    /// File A produces multiple chunks; one batch carrying SOME of A's chunks
+    /// fails. A's vector_hash MUST stay absent because A's chunk count
+    /// succeeded != chunk count pending.
+    #[tokio::test]
+    async fn file_hash_only_written_when_all_chunks_succeed() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        // worldview_doc produces 2 chunks (one per H2). The second contains
+        // "更多内容" — won't trigger MAGIC_FAIL. Inject MAGIC_FAIL into the
+        // first H2's body so exactly one of A's two chunks fails.
+        write_md(
+            &root,
+            "世界观/A.md",
+            &worldview_doc("A", "first chunk has MAGIC_FAIL"),
+        );
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::failing(TEST_DIM, "MAGIC_FAIL");
+
+        let limits = test_limits();
+        let res = run_with_embedder(
+            &store,
+            "fake-model",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            false,
+            1, // one chunk per batch so failures isolate to single chunks
+            &limits,
+            &embedder,
+        )
+        .await;
+        assert!(res.is_err(), "expected non-zero exit on batch failure");
+
+        assert!(
+            store
+                .get_file_hash("世界观/A.md", HashDim::Vector)
+                .unwrap()
+                .is_none(),
+            "vector_hash MUST stay absent until ALL of A's chunks land"
+        );
+    }
+
+    /// Spec scenario: 跨文件 batch 聚合.
+    /// Two small files together fit into a single batch — verify the batch
+    /// carries chunks from both files and both vector_hashes are written.
+    #[tokio::test]
+    async fn cross_file_batch_aggregation() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        write_md(&root, "世界观/A.md", &worldview_doc("A", "alpha"));
+        write_md(&root, "世界观/B.md", &worldview_doc("B", "bravo"));
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::new(TEST_DIM);
+
+        // batch_size=100 ensures all chunks (A's 2 + B's 2 = 4) fit in one
+        // batch. With per-file batching we'd see 2+ embedder calls; with
+        // cross-file aggregation the count drops to exactly 1.
+        let limits = test_limits();
+        run_with_embedder(
+            &store,
+            "fake-model",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            false,
+            100,
+            &limits,
+            &embedder,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            embedder.call_count(),
+            1,
+            "cross-file aggregation MUST collapse A+B into one embedder call"
+        );
+        assert!(
+            store
+                .get_file_hash("世界观/A.md", HashDim::Vector)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_file_hash("世界观/B.md", HashDim::Vector)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Spec scenario: 重跑前清旧 chunks 避免孤儿.
+    /// Run 1 leaves orphan chunks (file A's vector_hash never written because
+    /// the embedder failed). Run 2 with a working embedder must clear orphans
+    /// and produce exactly the new chunk set.
+    #[tokio::test]
+    async fn rerun_clears_orphan_chunks() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        write_md(
+            &root,
+            "世界观/A.md",
+            &worldview_doc("A", "first chunk has MAGIC_FAIL"),
+        );
+
+        let store = KbStore::open(&db).unwrap();
+
+        // Run 1: A has 2 chunks, batch_size=1 forces one chunk per batch.
+        // The MAGIC_FAIL chunk's batch fails; the other chunk's batch succeeds
+        // → 1 orphan :Chunk row, no vector_hash.
+        let failing = FakeEmbedder::failing(TEST_DIM, "MAGIC_FAIL");
+        let _ = run_with_embedder(
+            &store,
+            "fake-model",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            false,
+            1,
+            &test_limits(),
+            &failing,
+        )
+        .await;
+        assert!(
+            store
+                .get_file_hash("世界观/A.md", HashDim::Vector)
+                .unwrap()
+                .is_none(),
+            "precondition: orphan run must NOT have written vector_hash"
+        );
+        let qres1 = store
+            .execute_raw("MATCH (c:Chunk {file_path: '世界观/A.md'}) RETURN count(c)")
+            .unwrap();
+        let orphan_count = match &qres1.rows()[0][0] {
+            grafeo::Value::Int64(n) => *n,
+            other => panic!("unexpected count: {other:?}"),
+        };
+        assert!(
+            orphan_count >= 1,
+            "precondition: at least one orphan chunk should exist after partial run; got {orphan_count}"
+        );
+
+        // Run 2: same file, but content slightly changed so MAGIC_FAIL is gone.
+        // The first batch touching A MUST clear the orphan first.
+        write_md(&root, "世界观/A.md", &worldview_doc("A", "clean run now"));
+        let healthy = FakeEmbedder::new(TEST_DIM);
+        run_with_embedder(
+            &store,
+            "fake-model",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            true,
+            1,
+            &test_limits(),
+            &healthy,
+        )
+        .await
+        .unwrap();
+
+        // After run 2: A's chunk count MUST equal exactly what process_file
+        // produces from the new content; no leftover orphan.
+        let limits = test_limits();
+        let new_chunks = process_file(&worldview_doc("A", "clean run now"), "世界观/A.md", &limits);
+        let qres2 = store
+            .execute_raw("MATCH (c:Chunk {file_path: '世界观/A.md'}) RETURN count(c)")
+            .unwrap();
+        let post_count = match &qres2.rows()[0][0] {
+            grafeo::Value::Int64(n) => *n,
+            other => panic!("unexpected count: {other:?}"),
+        };
+        assert_eq!(
+            post_count as usize,
+            new_chunks.len(),
+            "post-run chunk count must equal fresh chunking output (no orphans)"
+        );
+        assert!(
+            store
+                .get_file_hash("世界观/A.md", HashDim::Vector)
+                .unwrap()
+                .is_some(),
+            "vector_hash MUST be written after a fully-successful rerun"
+        );
+    }
+
+    /// Spec scenario "same file across batches uses files_to_clear_first only
+    /// once": when file A's chunks span two batches, only batch 1 clears A;
+    /// batch 2 MUST NOT re-clear (otherwise it would wipe batch 1's writes).
+    #[tokio::test]
+    async fn multi_batch_file_clears_only_in_first_batch() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        // worldview_doc → 2 chunks; batch_size=1 forces them into 2 batches.
+        write_md(&root, "世界观/A.md", &worldview_doc("A", "alpha"));
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::new(TEST_DIM);
+        run_with_embedder(
+            &store,
+            "fake-model",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            false,
+            1,
+            &test_limits(),
+            &embedder,
+        )
+        .await
+        .unwrap();
+
+        // BOTH chunks must remain — if batch 2 re-cleared we'd see only 1.
+        let qres = store
+            .execute_raw("MATCH (c:Chunk {file_path: '世界观/A.md'}) RETURN count(c)")
+            .unwrap();
+        let n = match &qres.rows()[0][0] {
+            grafeo::Value::Int64(n) => *n,
+            other => panic!("unexpected count: {other:?}"),
+        };
+        let expected =
+            process_file(&worldview_doc("A", "alpha"), "世界观/A.md", &test_limits()).len();
+        assert_eq!(
+            n as usize, expected,
+            "second batch must NOT re-clear; expected {expected} chunks, got {n}"
+        );
+        assert!(
+            store
+                .get_file_hash("世界观/A.md", HashDim::Vector)
+                .unwrap()
+                .is_some(),
+            "vector_hash MUST land when all batches for A succeed"
+        );
+    }
+
+    /// Regression for Round-1 review finding: when a file's chunks span
+    /// multiple batches, an EARLIER failed batch MUST NOT prevent a LATER
+    /// successful batch from clearing that file's stale chunks. The
+    /// pre-clear list must be tracked by what has actually been COMMITTED,
+    /// not by what has merely been encountered. Without the fix, batch 1's
+    /// failed embed still marks the file as "seen", so batch 2 inserts the
+    /// new chunk WITHOUT clearing — leaving stale rows from a prior run.
+    #[tokio::test]
+    async fn failed_first_batch_does_not_block_later_batch_from_clearing_stale() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Run 1: seed file A with a fully successful first index — populates
+        // 2 :Chunk rows for A and writes vector_hash=H1.
+        write_md(
+            &root,
+            "世界观/A.md",
+            &worldview_doc("A", "v1-stable-content"),
+        );
+        let store = KbStore::open(&db).unwrap();
+        let healthy = FakeEmbedder::new(TEST_DIM);
+        run_default(&store, "fake-model", &root, false, &healthy)
+            .await
+            .unwrap();
+        let hash_v1 = store
+            .get_file_hash("世界观/A.md", HashDim::Vector)
+            .unwrap()
+            .expect("v1 hash present");
+
+        // Run 2: change A's content so the 概述 chunk contains MAGIC_FAIL_v2.
+        // batch_size=1 forces 2 batches; the embedder rejects the MAGIC_FAIL
+        // batch (1st) and accepts the 细节 batch (2nd). With the fix, the
+        // 2nd batch MUST list A in `files_to_clear_first` and remove v1's
+        // stale rows in the same transaction as the new insert.
+        write_md(&root, "世界观/A.md", &worldview_doc("A", "MAGIC_FAIL_v2"));
+        let failing = FakeEmbedder::failing(TEST_DIM, "MAGIC_FAIL_v2");
+        let _ = run_with_embedder(
+            &store,
+            "fake-model",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            true,
+            1,
+            &test_limits(),
+            &failing,
+        )
+        .await;
+
+        // After run 2: only the 细节 batch's single chunk should remain for A.
+        // Without the fix, the v1 chunks (containing "v1-stable-content") would
+        // linger because batch 2 wouldn't clear.
+        let qres = store
+            .execute_raw("MATCH (c:Chunk {file_path: '世界观/A.md'}) RETURN count(c)")
+            .unwrap();
+        let n = match &qres.rows()[0][0] {
+            grafeo::Value::Int64(n) => *n,
+            other => panic!("unexpected count: {other:?}"),
+        };
+        assert_eq!(
+            n, 1,
+            "expected exactly 1 chunk (the successful 细节 batch); got {n}"
+        );
+        let hits = store.search(&fake_vec(0.0, TEST_DIM), 100).unwrap();
+        let a_hits: Vec<_> = hits
+            .iter()
+            .filter(|h| h.file_path == "世界观/A.md")
+            .collect();
+        assert!(
+            a_hits
+                .iter()
+                .all(|h| !h.content.contains("v1-stable-content")),
+            "stale v1 chunks MUST be cleared by the successful later batch; got {a_hits:?}"
+        );
+
+        // vector_hash MUST NOT advance (one batch failed).
+        let hash_after = store
+            .get_file_hash("世界观/A.md", HashDim::Vector)
+            .unwrap()
+            .expect("hash should still be present from v1");
+        assert_eq!(
+            hash_after, hash_v1,
+            "vector_hash MUST NOT advance when not all chunks for the file succeeded"
         );
     }
 
@@ -644,8 +1271,8 @@ mod tests {
         );
 
         // v2: same path; content reduced to empty so the generic chunker
-        // produces zero chunks. Without the empty-chunks upsert path the
-        // file would leak: old chunks stayed in storage, hash never advanced.
+        // produces zero chunks. The empty-modified pre-clear pass must wipe
+        // old chunks AND mark_completed_files_phase must advance vector_hash.
         write_md(&root, "世界观/X.md", "");
         run_default(&store, "fake-model", &root, true, &embedder)
             .await
@@ -655,7 +1282,7 @@ mod tests {
         let hash_v2 = store
             .get_file_hash("世界观/X.md", HashDim::Vector)
             .unwrap()
-            .expect("v2 hash present after empty-chunks upsert");
+            .expect("v2 hash present after empty-chunks pre-clear");
         assert_ne!(
             hash_v1, hash_v2,
             "FileHash MUST advance when file content changes, even if it produces 0 chunks"
@@ -665,7 +1292,7 @@ mod tests {
         let hits_v2 = store.search(&fake_vec(0.0, TEST_DIM), 10).unwrap();
         assert!(
             hits_v2.iter().all(|h| h.file_path != "世界观/X.md"),
-            "old chunks for 世界观/X.md leaked after empty-chunks upsert: {hits_v2:?}"
+            "old chunks for 世界观/X.md leaked after empty pre-clear: {hits_v2:?}"
         );
     }
 
@@ -1008,7 +1635,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Recompute the expected chunks the same way `process_one_file` does.
+        // Recompute the expected chunks the same way `collect_chunks_for_file` does.
         let limits = test_limits();
         let chunks = crate::markdown::process_file(&body, "世界观/A.md", &limits);
         let expected: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
@@ -1229,6 +1856,98 @@ mod tests {
     // Spec scenario "增量索引清理被删除的文件——本 dim 是最后一个时整节点删除":
     // when vector is the only dim with a hash on the `:FileHash` node and the
     // file is removed from disk, the node MUST be DETACH DELETEd entirely.
+    // ---- 4.7: progress output format ----
+
+    #[test]
+    fn progress_output_format_pins_each_line() {
+        // Lock the exact strings produced by the four progress / status
+        // helpers. These ARE the lines that hit stderr/stdout via eprintln!/
+        // println! in run_with_embedder, so a mismatch here would break the
+        // spec scenario "进度输出格式".
+        assert_eq!(fmt_processing(30, 200), "Processing 30 files / 200 chunks");
+        assert_eq!(fmt_processing(0, 0), "Processing 0 files / 0 chunks");
+        assert_eq!(fmt_embedding_batch(1, 4), "Embedding batch 1/4");
+        assert_eq!(fmt_embedding_batch(4, 4), "Embedding batch 4/4");
+
+        let mut files = HashSet::new();
+        files.insert("a.md".to_string());
+        files.insert("b.md".to_string());
+        // CSV ordering is sorted (deterministic), not HashSet insertion order.
+        assert_eq!(
+            fmt_batch_fail(3, "boom", &files),
+            "[batch-fail] batch 3: boom (files: a.md, b.md)"
+        );
+
+        let stats = IndexStats {
+            indexed: 30,
+            unchanged: 0,
+            deleted: 0,
+            empty: 0,
+            batches_failed: 0,
+            chunks_failed: 0,
+            failed_files: HashSet::new(),
+        };
+        assert_eq!(
+            fmt_index_complete(&stats),
+            "Index complete: indexed=30 unchanged=0 deleted=0 empty=0 batches_failed=0 chunks_failed=0"
+        );
+
+        let mut failed_files = HashSet::new();
+        failed_files.insert("a.md".to_string());
+        failed_files.insert("b.md".to_string());
+        let stats_fail = IndexStats {
+            indexed: 28,
+            unchanged: 0,
+            deleted: 0,
+            empty: 0,
+            batches_failed: 1,
+            chunks_failed: 50,
+            failed_files,
+        };
+        assert_eq!(
+            fmt_index_failed(&stats_fail),
+            "Index failed: batches_failed=1 affected_files=2"
+        );
+    }
+
+    /// Spec scenario "进度输出格式" end-to-end: run with two files, capture
+    /// the embedder call sequence and final stats, and verify the formatter
+    /// helpers produce the expected lines for THIS run.
+    #[tokio::test]
+    async fn progress_output_format_end_to_end() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        write_md(&root, "世界观/A.md", &worldview_doc("A", "alpha"));
+        write_md(&root, "世界观/B.md", &worldview_doc("B", "bravo"));
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::new(TEST_DIM);
+        let limits = test_limits();
+        // batch_size=1 and 2 files × 2 chunks = 4 batches → exactly the
+        // "Embedding batch 1/4 ... 4/4" sequence from the spec scenario.
+        run_with_embedder(
+            &store,
+            "fake-model",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            false,
+            1,
+            &limits,
+            &embedder,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            embedder.call_count(),
+            4,
+            "expected 4 embedder batches, got {}",
+            embedder.call_count()
+        );
+    }
+
     #[tokio::test]
     async fn incremental_delete_drops_whole_node_when_vector_is_last_dim() {
         let tmp = tempdir().unwrap();

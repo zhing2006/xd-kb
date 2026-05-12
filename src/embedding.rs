@@ -1,3 +1,12 @@
+//! OpenAI-compatible embedding HTTP client.
+//!
+//! `EmbeddingClient::embed_batch` returns `Err(...)` when its retry budget is
+//! exhausted. The caller is responsible for translating that `Err` into a
+//! per-batch failure counter (e.g. `IndexStats::batches_failed += 1`) rather
+//! than propagating it with `?` and aborting the whole index run — the new
+//! per-batch failure isolation contract lives in `crate::index`, NOT in this
+//! module. See `xd-spec/changes/xd-kb-batch-indexing/` for the design.
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
