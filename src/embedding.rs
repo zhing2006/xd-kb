@@ -43,6 +43,7 @@ pub struct EmbeddingClient {
 struct EmbeddingRequest<'a> {
     model: &'a str,
     input: &'a [String],
+    dimensions: usize,
 }
 
 #[derive(Deserialize)]
@@ -104,12 +105,17 @@ impl EmbeddingClient {
         }
     }
 
-    async fn try_send(&self, texts: &[String]) -> SendOutcome {
-        let url = format!("{}/embeddings", self.api_base);
-        let request = EmbeddingRequest {
+    fn build_request<'a>(&'a self, texts: &'a [String]) -> EmbeddingRequest<'a> {
+        EmbeddingRequest {
             model: &self.model,
             input: texts,
-        };
+            dimensions: self.dim,
+        }
+    }
+
+    async fn try_send(&self, texts: &[String]) -> SendOutcome {
+        let url = format!("{}/embeddings", self.api_base);
+        let request = self.build_request(texts);
 
         let response = match self
             .client
@@ -344,6 +350,34 @@ mod tests {
     }
 
     // --- Response parsing ---
+
+    #[test]
+    fn build_request_dimensions_follow_env_xd_kb_dim() {
+        // Reproduces the bug we hit with voyage-4-large: when XD_KB_DIM is set
+        // to a non-default value, the outgoing request body must carry that
+        // dim as `dimensions` (OpenAI-compat name). Without this test, the
+        // env var silently failed to reach the wire and we got the model
+        // default back instead.
+        crate::config::with_env(
+            &[
+                (crate::config::ENV_API_BASE, Some("http://x/v1")),
+                (crate::config::ENV_API_KEY, Some("k")),
+                (crate::config::ENV_MODEL, Some("voyage-4-large")),
+                (crate::config::ENV_DIM, Some("2048")),
+                (crate::config::ENV_MAX_CHUNK_CHARS, None),
+            ],
+            || {
+                let cfg = Config::from_env().expect("config should load");
+                let client = EmbeddingClient::new(&cfg, RetryConfig::default());
+                let texts = vec!["hi".to_string()];
+                let req = client.build_request(&texts);
+                let v = serde_json::to_value(&req).expect("serialize request");
+                assert_eq!(v["model"], "voyage-4-large");
+                assert_eq!(v["dimensions"], 2048);
+                assert_eq!(v["input"], serde_json::json!(["hi"]));
+            },
+        );
+    }
 
     #[test]
     fn test_parse_embedding_response() {
