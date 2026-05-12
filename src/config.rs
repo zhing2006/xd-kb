@@ -174,9 +174,13 @@ fn build_glob_set(patterns: &[String], source: &Path, field: &str) -> Result<Glo
         })?;
         builder.add(g);
     }
-    builder
-        .build()
-        .map_err(|e| anyhow!("{} glob set (from {}) failed to build: {e}", field, source.display()))
+    builder.build().map_err(|e| {
+        anyhow!(
+            "{} glob set (from {}) failed to build: {e}",
+            field,
+            source.display()
+        )
+    })
 }
 
 /// Walk upwards from `start` until a directory containing `.xd-kb.yaml` is
@@ -522,11 +526,7 @@ mod tests {
     #[test]
     fn kb_config_invalid_glob_pattern_errors() {
         let tmp = tempdir().unwrap();
-        std::fs::write(
-            yaml_path_in(tmp.path()),
-            "include:\n  - \"[unbalanced\"\n",
-        )
-        .unwrap();
+        std::fs::write(yaml_path_in(tmp.path()), "include:\n  - \"[unbalanced\"\n").unwrap();
         let err = KbConfig::load_for_root(tmp.path()).expect_err("bad glob must fail");
         let msg = format!("{err}");
         assert!(

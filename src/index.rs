@@ -1051,9 +1051,8 @@ mod tests {
         std::fs::write(root.join(".xd-kb.yaml"), "include:\n  - \"**/*.md\"\n").unwrap();
         let kb_config = KbConfig::load_for_root(root).expect("load .xd-kb.yaml");
 
-        let entries: Vec<Result<std::path::PathBuf>> = vec![
-            Err(anyhow::anyhow!("synthetic walk failure")),
-        ];
+        let entries: Vec<Result<std::path::PathBuf>> =
+            vec![Err(anyhow::anyhow!("synthetic walk failure"))];
         let res = collect_markdown_from_entries(root, &kb_config, entries);
         let err = res.expect_err("walk error MUST be propagated");
         let msg = format!("{err}");

@@ -140,10 +140,7 @@ fn resolve_root(explicit: Option<&Path>, cwd: &Path) -> Option<RootResolution> {
 ///   plus symlink-aware canonicalize check when the file exists);
 /// - normalize `\` → `/` in the store key so DB keys are identical across
 ///   Windows and POSIX KBs.
-fn validate_and_normalize(
-    resolution: &RootResolution,
-    file: &Path,
-) -> Result<(PathBuf, String)> {
+fn validate_and_normalize(resolution: &RootResolution, file: &Path) -> Result<(PathBuf, String)> {
     if file.is_absolute() {
         bail!(
             "<file> {} must be a relative path when --root or implicit .xd-kb.yaml is in effect",
@@ -673,8 +670,7 @@ mod tests {
 
         // <file> argument is relative to <root>.
         let file_arg = std::path::PathBuf::from("故事/X.md");
-        run(&db, &file_arg, HashDim::Graph, true, Some(&root))
-            .expect("explicit root mark");
+        run(&db, &file_arg, HashDim::Graph, true, Some(&root)).expect("explicit root mark");
 
         // FileHash MUST be reachable via the relative key with `/` separators.
         let store = KbStore::open(&db).unwrap();
@@ -711,8 +707,14 @@ mod tests {
         let resolution = resolve_root(None, &cwd).expect("ancestor with .xd-kb.yaml");
         match &resolution {
             RootResolution::Implicit { root, cwd: r_cwd } => {
-                assert_eq!(root, &kb_root, "root MUST be the dir containing .xd-kb.yaml");
-                assert_eq!(r_cwd, &cwd, "implicit MUST remember cwd for cwd-relative <file>");
+                assert_eq!(
+                    root, &kb_root,
+                    "root MUST be the dir containing .xd-kb.yaml"
+                );
+                assert_eq!(
+                    r_cwd, &cwd,
+                    "implicit MUST remember cwd for cwd-relative <file>"
+                );
             }
             other => panic!("expected Implicit, got {other:?}"),
         }
@@ -791,8 +793,7 @@ mod tests {
         // The test process cwd is somewhere under the workspace; the workspace
         // tree carries no `.xd-kb.yaml`, so resolve_root returns None and run
         // takes the legacy branch.
-        run(&db, &file, HashDim::Vector, true, None)
-            .expect("fallback verbatim mark");
+        run(&db, &file, HashDim::Vector, true, None).expect("fallback verbatim mark");
 
         // Store key is the file's verbatim to_string_lossy() form (absolute).
         let store = KbStore::open(&db).unwrap();
@@ -864,8 +865,7 @@ mod tests {
 
         let resolution = RootResolution::Explicit { root: root.clone() };
         let (disk_path, store_path) =
-            validate_and_normalize(&resolution, Path::new("./故事/X.md"))
-                .expect("validate ./");
+            validate_and_normalize(&resolution, Path::new("./故事/X.md")).expect("validate ./");
 
         // disk lookup must hit the same file as without the `./`.
         assert_eq!(disk_path, root.join("./故事/X.md"));
@@ -886,9 +886,8 @@ mod tests {
         write_file(&root.join("X.md"), b"dotdot-test");
 
         let resolution = RootResolution::Explicit { root: root.clone() };
-        let (_disk, store_path) =
-            validate_and_normalize(&resolution, Path::new("故事/../X.md"))
-                .expect("validate non-escaping ..");
+        let (_disk, store_path) = validate_and_normalize(&resolution, Path::new("故事/../X.md"))
+            .expect("validate non-escaping ..");
 
         assert_eq!(
             store_path, "X.md",
@@ -931,8 +930,7 @@ mod tests {
         // Backslash separator on input — common when scripts copy in Windows
         // paths verbatim.
         let file_arg = std::path::PathBuf::from(r"故事\X.md");
-        run(&db, &file_arg, HashDim::Vector, true, Some(&root))
-            .expect("backslash file mark");
+        run(&db, &file_arg, HashDim::Vector, true, Some(&root)).expect("backslash file mark");
 
         let store = KbStore::open(&db).unwrap();
         assert!(
