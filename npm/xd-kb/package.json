@@ -1,6 +1,6 @@
 {
   "name": "xd-kb",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "npm wrapper for the xd-kb Rust CLI",
   "license": "Proprietary",
   "repository": {
