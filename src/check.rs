@@ -214,9 +214,7 @@ fn string_normalise_under_root(rel: &Path) -> Option<PathBuf> {
         match comp {
             Component::CurDir => {}
             Component::ParentDir => {
-                if stack.pop().is_none() {
-                    return None;
-                }
+                stack.pop()?;
             }
             Component::Normal(seg) => stack.push(seg.to_os_string()),
             Component::RootDir | Component::Prefix(_) => {

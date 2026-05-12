@@ -449,42 +449,6 @@ impl KbStore {
         }
     }
 
-    /// Force-rebuild helper: drop every node related to `file_path` — all
-    /// `:Chunk` rows AND the whole `:FileHash` node, regardless of which
-    /// `<dim>_hash` properties the node still carries.
-    ///
-    /// **Not used by `index --incremental`** — incremental cleanup goes
-    /// through [`delete_vector_dim_for_file`] to honour the per-dim contract.
-    /// Reserve this function for explicit force-rebuild paths where the
-    /// caller knows it's safe to nuke other dims too.
-    pub fn delete_file_completely(&self, file_path: &str) -> Result<()> {
-        let mut session = self.db.session();
-        session
-            .begin_transaction()
-            .map_err(|e| anyhow!("begin txn for delete_file_completely: {e}"))?;
-        let res = (|| -> Result<()> {
-            let mut p1 = HashMap::new();
-            p1.insert("path".to_string(), Value::from(file_path));
-            session
-                .execute_with_params("MATCH (c:Chunk {file_path: $path}) DETACH DELETE c", p1)
-                .map_err(|e| anyhow!("delete chunks: {e}"))?;
-
-            let mut p2 = HashMap::new();
-            p2.insert("path".to_string(), Value::from(file_path));
-            session
-                .execute_with_params("MATCH (h:FileHash {path: $path}) DETACH DELETE h", p2)
-                .map_err(|e| anyhow!("delete FileHash: {e}"))?;
-            Ok(())
-        })();
-        match res {
-            Ok(()) => session.commit().map_err(|e| anyhow!("commit: {e}")),
-            Err(e) => {
-                let _ = session.rollback();
-                Err(e)
-            }
-        }
-    }
-
     // ---------- KNN ----------
 
     pub fn search(&self, query_vector: &[f32], top_n: usize) -> Result<Vec<SearchResult>> {
@@ -1117,43 +1081,6 @@ mod tests {
                 .as_deref(),
             Some("g-hash")
         );
-    }
-
-    #[test]
-    fn delete_file_completely_removes_chunks_and_hash() {
-        let store = KbStore::open_in_memory();
-        store.ensure_chunk_vector_index(4).unwrap();
-
-        store
-            .upsert_chunks_for_file(
-                "x.md",
-                "h",
-                &[mk_chunk(
-                    "x.md",
-                    1,
-                    1,
-                    "to be removed",
-                    embed(&[1.0, 0.0, 0.0]),
-                )],
-            )
-            .unwrap();
-        assert!(
-            store
-                .get_file_hash("x.md", HashDim::Vector)
-                .unwrap()
-                .is_some()
-        );
-
-        store.delete_file_completely("x.md").unwrap();
-        assert!(
-            store
-                .get_file_hash("x.md", HashDim::Vector)
-                .unwrap()
-                .is_none()
-        );
-
-        let hits = store.search(&embed(&[1.0, 0.0, 0.0]), 10).unwrap();
-        assert!(hits.iter().all(|h| h.file_path != "x.md"), "{hits:?}");
     }
 
     #[test]
