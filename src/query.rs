@@ -31,6 +31,7 @@ pub async fn run(
     top: usize,
     lambda: f32,
     fetch_pool: usize,
+    full: bool,
     retry: &RetryConfig,
 ) -> Result<()> {
     let cfg = Config::from_env()?;
@@ -51,7 +52,7 @@ pub async fn run(
         &embedder,
     )
     .await?;
-    print_results(&results);
+    println!("{}", format_results(&results, full));
     Ok(())
 }
 
@@ -106,28 +107,47 @@ async fn run_with_embedder(
     }
 }
 
-fn print_results(results: &[SearchResult]) {
+fn format_results(results: &[SearchResult], full: bool) -> String {
     if results.is_empty() {
-        println!("(no results)");
-        return;
+        return "(no results)".to_string();
     }
+    let mut out = String::new();
     for (i, r) in results.iter().enumerate() {
-        println!(
-            "{:>2}. [{:.4}] {}:{}-{}\n    {}",
+        if i > 0 {
+            out.push_str(if full { "\n\n" } else { "\n" });
+        }
+        let header = format!(
+            "{:>2}. [{:.4}] {}:{}-{}",
             i + 1,
             r.score,
             r.file_path,
             r.line_start,
             r.line_end,
-            r.content
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(120)
-                .collect::<String>(),
         );
+        out.push_str(&header);
+        out.push('\n');
+        if full {
+            for (j, line) in r.content.lines().enumerate() {
+                if j > 0 {
+                    out.push('\n');
+                }
+                out.push_str("    ");
+                out.push_str(line);
+            }
+        } else {
+            out.push_str("    ");
+            out.push_str(
+                &r.content
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect::<String>(),
+            );
+        }
     }
+    out
 }
 
 #[cfg(test)]
@@ -135,6 +155,53 @@ mod tests {
     use super::*;
     use crate::storage::ChunkInput;
     use tempfile::tempdir;
+
+    fn sample_results() -> Vec<SearchResult> {
+        let long_first_line: String = "x".repeat(150);
+        let multi_line = format!("{long_first_line}\nsecond line\nthird line");
+        vec![
+            SearchResult {
+                file_path: "doc-a.md".to_string(),
+                line_start: 1,
+                line_end: 5,
+                content: multi_line,
+                score: 0.9876,
+            },
+            SearchResult {
+                file_path: "doc-b.md".to_string(),
+                line_start: 10,
+                line_end: 12,
+                content: "single line content".to_string(),
+                score: 0.5,
+            },
+        ]
+    }
+
+    #[test]
+    fn format_results_compact_truncates_first_line() {
+        let results = sample_results();
+        let truncated_first: String = "x".repeat(120);
+        let expected = format!(
+            " 1. [0.9876] doc-a.md:1-5\n    {truncated_first}\n 2. [0.5000] doc-b.md:10-12\n    single line content"
+        );
+        assert_eq!(format_results(&results, false), expected);
+    }
+
+    #[test]
+    fn format_results_full_preserves_content() {
+        let results = sample_results();
+        let long_first_line: String = "x".repeat(150);
+        let expected = format!(
+            " 1. [0.9876] doc-a.md:1-5\n    {long_first_line}\n    second line\n    third line\n\n 2. [0.5000] doc-b.md:10-12\n    single line content"
+        );
+        assert_eq!(format_results(&results, true), expected);
+    }
+
+    #[test]
+    fn format_results_empty_returns_no_results_marker() {
+        assert_eq!(format_results(&[], false), "(no results)");
+        assert_eq!(format_results(&[], true), "(no results)");
+    }
 
     struct FixedQueryEmbedder {
         vec: Vec<f32>,

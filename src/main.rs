@@ -116,6 +116,13 @@ enum Commands {
         /// --lambda >= 1.0.
         #[arg(long)]
         fetch_pool: Option<usize>,
+        /// Render each hit's content in full (preserve all newlines, indent
+        /// each line by 4 spaces, separate hits by one blank line) instead of
+        /// the default compact rendering (first line, truncated to 120 chars).
+        /// Intended for LLM Agent / RAG callers that want the complete chunk
+        /// without an extra Read round-trip.
+        #[arg(long)]
+        full: bool,
     },
     /// Execute a raw GQL statement against the DB. The CLI does NOT auto-inject any predicate.
     Gql {
@@ -177,9 +184,10 @@ async fn main() -> Result<()> {
             top,
             lambda,
             fetch_pool,
+            full,
         } => {
             let fetch_pool = resolve_fetch_pool(top, fetch_pool)?;
-            query::run(&cli.db, &text, top, lambda, fetch_pool, &retry_config).await
+            query::run(&cli.db, &text, top, lambda, fetch_pool, full, &retry_config).await
         }
         Commands::Gql { statement } => gql::run(&cli.db, &statement),
         Commands::Check {
@@ -209,6 +217,7 @@ mod tests {
                 top,
                 lambda,
                 fetch_pool,
+                ..
             } => {
                 assert_eq!(text, "测试");
                 assert_eq!(top, 5);
@@ -485,5 +494,23 @@ mod tests {
         assert_eq!(cli.backoff_base, 2.0);
         assert_eq!(cli.backoff_exp, 2.0);
         assert_eq!(cli.max_retries, 3);
+    }
+
+    #[test]
+    fn parses_query_with_full() {
+        let cli = try_parse(&["xd-kb", "--db", "./kb.db", "query", "x", "--full"]).unwrap();
+        match cli.command {
+            Commands::Query { full, .. } => assert!(full),
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn parses_query_full_default_false() {
+        let cli = try_parse(&["xd-kb", "--db", "./kb.db", "query", "x"]).unwrap();
+        match cli.command {
+            Commands::Query { full, .. } => assert!(!full),
+            _ => panic!("expected Query"),
+        }
     }
 }

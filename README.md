@@ -80,6 +80,9 @@ xd-kb --db ./kb.db index ./docs --incremental
 # 3. 语义查询（默认 cosine top-N）
 xd-kb --db ./kb.db query "异步任务" --top 5
 
+# 3a. 语义查询 + 完整 chunk 输出（LLM Agent / RAG 默认开启，免再发 Read 取完整内容）
+xd-kb --db ./kb.db query "异步任务" --top 5 --full
+
 # 4. 语义查询 + MMR 多样性（lambda < 1.0 触发 MMR；越小越偏多样性）
 xd-kb --db ./kb.db query "异步任务" --top 5 --lambda 0.5
 xd-kb --db ./kb.db query "异步任务" --top 5 --lambda 0.3 --fetch-pool 40
@@ -142,6 +145,8 @@ exclude:
 - `--lambda >= 1.0` 时该值被忽略（cosine 路径不消费候选池）。
 
 `--lambda` 取值范围 `[0.0, 1.0]` 闭区间，越界（含 `--lambda -0.1` 这种空格分隔的负值）一律以非零退出码 + `--lambda must be in [0.0, 1.0]` 错误信息退出。
+
+`--full` 控制每条命中的 `content` 字段渲染：缺省（紧凑）只取首行并截断到 120 字符，便于人眼浏览；`--full` 原样输出完整 chunk content（保留所有换行、每行 4 空格缩进、命中之间用一个空行分隔），其他列（序号、相似度分数、`<file>:<start>-<end>` 头）不变。LLM Agent / RAG 调用方应默认开启，避免再发 Read 取完整 chunk。
 
 ### 多维度 hash schema
 
