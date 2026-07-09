@@ -96,6 +96,10 @@ enum Commands {
         /// Number of chunks per embedding batch
         #[arg(long, default_value = "50", value_parser = parse_positive_usize)]
         batch_size: usize,
+        /// Maximum embedding HTTP requests in flight at once. Writes stay
+        /// serial and ordered regardless; this only overlaps the network wait.
+        #[arg(long, default_value = "4", value_parser = parse_positive_usize)]
+        concurrency: usize,
     },
     /// Semantic query against the KB's vector index
     Query {
@@ -178,7 +182,18 @@ async fn main() -> Result<()> {
             root,
             incremental,
             batch_size,
-        } => index::run(&cli.db, &root, incremental, batch_size, &retry_config).await,
+            concurrency,
+        } => {
+            index::run(
+                &cli.db,
+                &root,
+                incremental,
+                batch_size,
+                concurrency,
+                &retry_config,
+            )
+            .await
+        }
         Commands::Query {
             text,
             top,
@@ -329,13 +344,47 @@ mod tests {
                 root,
                 incremental,
                 batch_size,
+                concurrency,
             } => {
                 assert_eq!(root, PathBuf::from("./docs"));
                 assert!(incremental);
                 assert_eq!(batch_size, 20);
+                assert_eq!(concurrency, 4, "default concurrency must be 4");
             }
             _ => panic!("expected Index"),
         }
+    }
+
+    #[test]
+    fn parses_index_with_concurrency() {
+        let cli = try_parse(&[
+            "xd-kb",
+            "--db",
+            "./kb.db",
+            "index",
+            "./docs",
+            "--concurrency",
+            "8",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Index { concurrency, .. } => assert_eq!(concurrency, 8),
+            _ => panic!("expected Index"),
+        }
+    }
+
+    #[test]
+    fn concurrency_zero_is_rejected() {
+        let result = try_parse(&[
+            "xd-kb",
+            "--db",
+            "./kb.db",
+            "index",
+            "./docs",
+            "--concurrency",
+            "0",
+        ]);
+        assert!(result.is_err(), "--concurrency 0 MUST be rejected");
     }
 
     #[test]

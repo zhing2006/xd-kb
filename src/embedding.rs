@@ -1,16 +1,33 @@
 //! OpenAI-compatible embedding HTTP client.
 //!
-//! `EmbeddingClient::embed_batch` returns `Err(...)` when its retry budget is
-//! exhausted. The caller is responsible for translating that `Err` into a
-//! per-batch failure counter (e.g. `IndexStats::batches_failed += 1`) rather
-//! than propagating it with `?` and aborting the whole index run — the new
-//! per-batch failure isolation contract lives in `crate::index`, NOT in this
-//! module. See `xd-spec/changes/xd-kb-batch-indexing/` for the design.
+//! Two request shapes share one endpoint (`{api_base}/embeddings`):
+//! - Flat: `input: [String]` — ordinary embedding models. Each text is
+//!   encoded independently.
+//! - Contextualized (model name contains `voyage-context`): `input` is a
+//!   nested list-of-lists where each inner list holds one document's chunks
+//!   in document order, plus an `input_type` hint (`document` / `query`).
+//!   The gateway routes these to Voyage's contextualized-chunk-embeddings
+//!   API and returns a two-level response (per-document objects each
+//!   carrying per-chunk vectors) which this module flattens back to one
+//!   vector per chunk.
+//!
+//! `embed_batch` / `embed_document_chunks` return `Err(...)` when the retry
+//! budget is exhausted. The caller is responsible for translating that `Err`
+//! into a per-batch failure counter rather than propagating it with `?` and
+//! aborting the whole index run — the failure-isolation contract lives in
+//! `crate::index`, NOT in this module.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+
+/// Contextualized chunk-embedding models need the nested request shape and
+/// per-document grouping. Routing is by model name so switching models is a
+/// pure `XD_KB_MODEL` change with no extra configuration.
+pub fn is_contextualized_model(model: &str) -> bool {
+    model.contains("voyage-context")
+}
 
 /// Exponential backoff retry configuration.
 ///
@@ -49,10 +66,24 @@ pub struct EmbeddingClient {
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+enum EmbeddingInput<'a> {
+    Flat(&'a [String]),
+    /// One inner list per document; chunks of the same document are encoded
+    /// together so each chunk vector carries whole-document context.
+    Nested(&'a [&'a [String]]),
+}
+
+#[derive(Serialize)]
 struct EmbeddingRequest<'a> {
     model: &'a str,
-    input: &'a [String],
+    input: EmbeddingInput<'a>,
     dimensions: usize,
+    /// Voyage retrieval hint: "document" at index time, "query" at query
+    /// time. Omitted entirely for ordinary models — unknown fields are not
+    /// universally tolerated by OpenAI-compatible backends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_type: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -60,9 +91,99 @@ struct EmbeddingResponse {
     data: Vec<EmbeddingData>,
 }
 
+/// One `data[]` item. Ordinary models return flat items carrying `embedding`
+/// directly; the contextualized endpoint returns one item per document whose
+/// `data` holds that document's per-chunk embeddings. Untagged so both shapes
+/// parse regardless of which backend variant answered.
 #[derive(Deserialize)]
-struct EmbeddingData {
+#[serde(untagged)]
+enum EmbeddingData {
+    Flat { embedding: Vec<f32> },
+    Nested { data: Vec<NestedEmbedding> },
+}
+
+#[derive(Deserialize)]
+struct NestedEmbedding {
     embedding: Vec<f32>,
+}
+
+/// Flatten a response into one vector per input chunk, preserving document
+/// order then in-document chunk order.
+fn flatten_response(resp: EmbeddingResponse) -> Vec<Vec<f32>> {
+    let mut vectors = Vec::new();
+    for item in resp.data {
+        match item {
+            EmbeddingData::Flat { embedding } => vectors.push(embedding),
+            EmbeddingData::Nested { data } => {
+                vectors.extend(data.into_iter().map(|n| n.embedding));
+            }
+        }
+    }
+    vectors
+}
+
+/// Expected response shape, decided by the request we sent.
+#[derive(Clone, Copy, PartialEq)]
+enum ResponseShape {
+    /// Accept flat items, and tolerate nested ones by flattening — gateways
+    /// answer contextualized *query* requests with a nested single-vector
+    /// response, so the lenient shape covers both ordinary batches and
+    /// queries.
+    Flat,
+    /// Single-document contextualized request: the response MUST be exactly
+    /// one nested document item. A flat response here means the backend fell
+    /// back to ordinary (context-free) embeddings — indexing those silently
+    /// would degrade every vector of the document, so it is a fatal error.
+    NestedDocument,
+}
+
+/// Parse a 2xx body and validate vector count + dimensions against what the
+/// request promised. Returns `Err(message)` for any mismatch — the caller
+/// maps it to `SendOutcome::FatalError` (mismatches are not retryable).
+fn parse_and_validate(
+    body: &[u8],
+    shape: ResponseShape,
+    expected: usize,
+    dim: usize,
+) -> std::result::Result<Vec<Vec<f32>>, String> {
+    let resp: EmbeddingResponse = serde_json::from_slice(body)
+        .map_err(|e| format!("Failed to parse embedding response: {e}"))?;
+    let vectors = match shape {
+        ResponseShape::Flat => flatten_response(resp),
+        ResponseShape::NestedDocument => {
+            if resp.data.len() != 1 {
+                return Err(format!(
+                    "Contextualized document response must contain exactly 1 document, got {}",
+                    resp.data.len()
+                ));
+            }
+            match resp.data.into_iter().next().expect("len checked above") {
+                EmbeddingData::Nested { data } => data.into_iter().map(|n| n.embedding).collect(),
+                EmbeddingData::Flat { .. } => {
+                    return Err(
+                        "Contextualized document request received a flat (context-free) \
+                         embedding response — refusing to index silently degraded vectors"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    };
+    if vectors.len() != expected {
+        return Err(format!(
+            "Embedding count mismatch: expected {expected}, got {}",
+            vectors.len()
+        ));
+    }
+    for (i, v) in vectors.iter().enumerate() {
+        if v.len() != dim {
+            return Err(format!(
+                "Embedding dimension mismatch at index {i}: expected {dim}, got {}",
+                v.len()
+            ));
+        }
+    }
+    Ok(vectors)
 }
 
 enum SendOutcome {
@@ -117,21 +238,26 @@ impl EmbeddingClient {
     fn build_request<'a>(&'a self, texts: &'a [String]) -> EmbeddingRequest<'a> {
         EmbeddingRequest {
             model: &self.model,
-            input: texts,
+            input: EmbeddingInput::Flat(texts),
             dimensions: self.dim,
+            input_type: None,
         }
     }
 
-    async fn try_send(&self, texts: &[String]) -> SendOutcome {
+    async fn try_send(
+        &self,
+        request: &EmbeddingRequest<'_>,
+        shape: ResponseShape,
+        expected: usize,
+    ) -> SendOutcome {
         let url = format!("{}/embeddings", self.api_base);
-        let request = self.build_request(texts);
 
         let response = match self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&request)
+            .json(request)
             .send()
             .await
         {
@@ -150,31 +276,9 @@ impl EmbeddingClient {
                     return SendOutcome::RetryableError(format!("body transfer error on 2xx: {e}"));
                 }
             };
-            match serde_json::from_slice::<EmbeddingResponse>(&body_bytes) {
-                Ok(resp) => {
-                    let vectors: Vec<Vec<f32>> =
-                        resp.data.into_iter().map(|d| d.embedding).collect();
-                    if vectors.len() != texts.len() {
-                        return SendOutcome::FatalError(format!(
-                            "Embedding count mismatch: expected {}, got {}",
-                            texts.len(),
-                            vectors.len()
-                        ));
-                    }
-                    let expected_dim = self.dim;
-                    for (i, v) in vectors.iter().enumerate() {
-                        if v.len() != expected_dim {
-                            return SendOutcome::FatalError(format!(
-                                "Embedding dimension mismatch at index {i}: expected {expected_dim}, got {}",
-                                v.len()
-                            ));
-                        }
-                    }
-                    SendOutcome::Success(vectors)
-                }
-                Err(e) => {
-                    SendOutcome::FatalError(format!("Failed to parse embedding response: {e}"))
-                }
+            match parse_and_validate(&body_bytes, shape, expected, self.dim) {
+                Ok(vectors) => SendOutcome::Success(vectors),
+                Err(msg) => SendOutcome::FatalError(msg),
             }
         } else if is_retryable_status(status) {
             let retry_after = parse_retry_after(&response);
@@ -189,11 +293,67 @@ impl EmbeddingClient {
         }
     }
 
+    /// Nested single-document request for contextualized models.
+    fn build_document_request<'a>(&'a self, nested: &'a [&'a [String]]) -> EmbeddingRequest<'a> {
+        EmbeddingRequest {
+            model: &self.model,
+            input: EmbeddingInput::Nested(nested),
+            dimensions: self.dim,
+            input_type: Some("document"),
+        }
+    }
+
+    /// Flat query request for contextualized models: the contextualized
+    /// endpoint accepts flat input only when the `query` hint is present.
+    fn build_query_request<'a>(&'a self, texts: &'a [String]) -> EmbeddingRequest<'a> {
+        EmbeddingRequest {
+            model: &self.model,
+            input: EmbeddingInput::Flat(texts),
+            dimensions: self.dim,
+            input_type: Some("query"),
+        }
+    }
+
+    /// Flat request without `input_type` — the ordinary embedding path.
     pub async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let request = self.build_request(texts);
+        self.send_with_retry(&request, ResponseShape::Flat, texts.len())
+            .await
+    }
+
+    /// One document's chunks embedded together (contextualized models only):
+    /// nested `input` with a single inner list, `input_type: "document"`.
+    /// Returns one vector per chunk, in chunk order. The response MUST come
+    /// back in the nested per-document shape (see `ResponseShape`).
+    pub async fn embed_document_chunks(&self, chunks: &[String]) -> Result<Vec<Vec<f32>>> {
+        let nested = [chunks];
+        let request = self.build_document_request(&nested);
+        self.send_with_retry(&request, ResponseShape::NestedDocument, chunks.len())
+            .await
+    }
+
+    /// Query-side embedding for contextualized models.
+    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let texts = [text.to_string()];
+        let request = self.build_query_request(&texts);
+        let mut vectors = self
+            .send_with_retry(&request, ResponseShape::Flat, 1)
+            .await?;
+        vectors
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("embedding response was empty"))
+    }
+
+    async fn send_with_retry(
+        &self,
+        request: &EmbeddingRequest<'_>,
+        shape: ResponseShape,
+        expected: usize,
+    ) -> Result<Vec<Vec<f32>>> {
         let max = self.retry_config.max_retries;
 
         for attempt in 0..=max {
-            match self.try_send(texts).await {
+            match self.try_send(request, shape, expected).await {
                 SendOutcome::Success(vectors) => return Ok(vectors),
                 SendOutcome::FatalError(msg) => bail!("{msg}"),
                 SendOutcome::RetryableError(desc) => {
@@ -230,15 +390,20 @@ impl EmbeddingClient {
 }
 
 /// Embed a single text using the configured remote OpenAI-compatible endpoint.
+/// Contextualized models require the `query` input_type hint; ordinary models
+/// keep the plain flat request.
 pub async fn embed_one(cfg: &Config, retry: &RetryConfig, text: &str) -> Result<Vec<f32>> {
     let client = EmbeddingClient::new(cfg, *retry);
+    if is_contextualized_model(&cfg.model) {
+        return client.embed_query(text).await;
+    }
     let mut vectors = client.embed_batch(&[text.to_string()]).await?;
     vectors
         .pop()
         .ok_or_else(|| anyhow::anyhow!("embedding response was empty"))
 }
 
-/// Embed a batch of texts in a single API call.
+/// Embed a batch of texts in a single API call (flat, ordinary models).
 pub async fn embed_batch(
     cfg: &Config,
     retry: &RetryConfig,
@@ -246,6 +411,16 @@ pub async fn embed_batch(
 ) -> Result<Vec<Vec<f32>>> {
     let client = EmbeddingClient::new(cfg, *retry);
     client.embed_batch(texts).await
+}
+
+/// Embed one document's chunks together via the contextualized request shape.
+pub async fn embed_document(
+    cfg: &Config,
+    retry: &RetryConfig,
+    chunks: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    let client = EmbeddingClient::new(cfg, *retry);
+    client.embed_document_chunks(chunks).await
 }
 
 #[cfg(test)]
@@ -389,6 +564,166 @@ mod tests {
     }
 
     #[test]
+    fn contextualized_model_detection() {
+        assert!(is_contextualized_model("voyage/voyage-context-4"));
+        assert!(is_contextualized_model("voyage-context-3"));
+        assert!(!is_contextualized_model("voyage/voyage-4-large"));
+        assert!(!is_contextualized_model("text-embedding-3-large"));
+    }
+
+    #[test]
+    fn nested_document_request_serializes_list_of_lists_with_input_type() {
+        // Locks the PRODUCTION builder (`build_document_request`) — a
+        // hand-rolled request here would keep passing even if the builder
+        // regressed to flat input or dropped the document hint.
+        crate::config::with_env(
+            &[
+                (crate::config::ENV_API_BASE, Some("http://x/v1")),
+                (crate::config::ENV_API_KEY, Some("k")),
+                (crate::config::ENV_MODEL, Some("voyage/voyage-context-4")),
+                (crate::config::ENV_DIM, Some("2048")),
+                (crate::config::ENV_MAX_CHUNK_CHARS, None),
+            ],
+            || {
+                let cfg = Config::from_env().expect("config should load");
+                let client = EmbeddingClient::new(&cfg, RetryConfig::default());
+                let chunks = vec!["c1".to_string(), "c2".to_string()];
+                let nested = [chunks.as_slice()];
+                let req = client.build_document_request(&nested);
+                let v = serde_json::to_value(&req).expect("serialize request");
+                assert_eq!(v["model"], "voyage/voyage-context-4");
+                assert_eq!(v["input"], serde_json::json!([["c1", "c2"]]));
+                assert_eq!(v["input_type"], "document");
+                assert_eq!(v["dimensions"], 2048);
+            },
+        );
+    }
+
+    #[test]
+    fn flat_request_omits_input_type_key_entirely() {
+        let texts = vec!["hi".to_string()];
+        let req = EmbeddingRequest {
+            model: "voyage-4-large",
+            input: EmbeddingInput::Flat(&texts),
+            dimensions: 1024,
+            input_type: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("input_type"),
+            "ordinary requests must not carry input_type at all"
+        );
+        assert_eq!(v["input"], serde_json::json!(["hi"]));
+    }
+
+    /// Shape captured from the live gateway (LiteLLM → voyage-context-4):
+    /// `data` holds one object per document, each with its own `data` array
+    /// of per-chunk embeddings. Flattening preserves doc order then chunk
+    /// order.
+    #[test]
+    fn parse_contextualized_nested_response() {
+        let json = r#"{
+            "model": "voyage/voyage-context-4",
+            "data": [
+                {"object": "list", "index": 0, "data": [
+                    {"object": "embedding", "index": 0, "embedding": [0.1, 0.2]},
+                    {"object": "embedding", "index": 1, "embedding": [0.3, 0.4]}
+                ]},
+                {"object": "list", "index": 1, "data": [
+                    {"object": "embedding", "index": 0, "embedding": [0.5, 0.6]}
+                ]}
+            ],
+            "usage": {"prompt_tokens": 20, "total_tokens": 20}
+        }"#;
+        let resp: EmbeddingResponse = serde_json::from_str(json).unwrap();
+        let vectors = flatten_response(resp);
+        assert_eq!(
+            vectors,
+            vec![vec![0.1, 0.2], vec![0.3, 0.4], vec![0.5, 0.6]]
+        );
+    }
+
+    #[test]
+    fn query_request_is_flat_single_input_with_query_hint() {
+        crate::config::with_env(
+            &[
+                (crate::config::ENV_API_BASE, Some("http://x/v1")),
+                (crate::config::ENV_API_KEY, Some("k")),
+                (crate::config::ENV_MODEL, Some("voyage/voyage-context-4")),
+                (crate::config::ENV_DIM, Some("2048")),
+                (crate::config::ENV_MAX_CHUNK_CHARS, None),
+            ],
+            || {
+                let cfg = Config::from_env().expect("config should load");
+                let client = EmbeddingClient::new(&cfg, RetryConfig::default());
+                let texts = ["法国的首都是哪里？".to_string()];
+                let req = client.build_query_request(&texts);
+                let v = serde_json::to_value(&req).expect("serialize request");
+                assert_eq!(v["input"], serde_json::json!(["法国的首都是哪里？"]));
+                assert_eq!(v["input_type"], "query");
+                assert_eq!(v["dimensions"], 2048);
+            },
+        );
+    }
+
+    // --- ResponseShape validation (fatal-error contract) ---
+
+    /// Regression lock for the "silent degradation" trap: a document request
+    /// answered with a flat (context-free) response MUST be rejected even
+    /// when count and dims happen to match.
+    #[test]
+    fn document_shape_rejects_flat_response() {
+        // Single-chunk document answered by a single flat item: count (1) and
+        // dims (2) both match, so only the shape check can catch the
+        // degradation.
+        let body = br#"{"data": [{"embedding": [0.1, 0.2]}]}"#;
+        let err = parse_and_validate(body, ResponseShape::NestedDocument, 1, 2)
+            .expect_err("flat response must be rejected for document requests");
+        assert!(
+            err.contains("flat"),
+            "error should name the flat-response degradation: {err}"
+        );
+    }
+
+    #[test]
+    fn document_shape_rejects_multi_document_response() {
+        let body = br#"{"data": [
+            {"data": [{"embedding": [0.1, 0.2]}]},
+            {"data": [{"embedding": [0.3, 0.4]}]}
+        ]}"#;
+        let err = parse_and_validate(body, ResponseShape::NestedDocument, 2, 2)
+            .expect_err("multi-document response must be rejected");
+        assert!(err.contains("exactly 1 document"), "got: {err}");
+    }
+
+    #[test]
+    fn count_mismatch_is_fatal() {
+        let body = br#"{"data": [{"data": [{"embedding": [0.1, 0.2]}]}]}"#;
+        let err = parse_and_validate(body, ResponseShape::NestedDocument, 2, 2)
+            .expect_err("missing vector must be a count mismatch");
+        assert!(err.contains("count mismatch"), "got: {err}");
+        assert!(err.contains("expected 2, got 1"), "got: {err}");
+    }
+
+    #[test]
+    fn dimension_mismatch_is_fatal() {
+        let body = br#"{"data": [{"embedding": [0.1, 0.2, 0.3]}]}"#;
+        let err = parse_and_validate(body, ResponseShape::Flat, 1, 2)
+            .expect_err("wrong-dim vector must be a dimension mismatch");
+        assert!(err.contains("dimension mismatch"), "got: {err}");
+        assert!(err.contains("expected 2, got 3"), "got: {err}");
+    }
+
+    #[test]
+    fn flat_shape_accepts_nested_query_response() {
+        // Gateways answer contextualized *query* requests with a nested
+        // single-vector response — the lenient Flat shape must flatten it.
+        let body = br#"{"data": [{"data": [{"embedding": [0.1, 0.2]}]}]}"#;
+        let vectors = parse_and_validate(body, ResponseShape::Flat, 1, 2).unwrap();
+        assert_eq!(vectors, vec![vec![0.1, 0.2]]);
+    }
+
+    #[test]
     fn test_parse_embedding_response() {
         let json = r#"{
             "data": [
@@ -400,9 +735,10 @@ mod tests {
         }"#;
 
         let resp: EmbeddingResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.data.len(), 2);
-        assert_eq!(resp.data[0].embedding, vec![0.1, 0.2, 0.3]);
-        assert_eq!(resp.data[1].embedding, vec![0.4, 0.5, 0.6]);
+        let vectors = flatten_response(resp);
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], vec![0.1, 0.2, 0.3]);
+        assert_eq!(vectors[1], vec![0.4, 0.5, 0.6]);
     }
 
     // Config-from-env gating is covered exhaustively in `config::tests`

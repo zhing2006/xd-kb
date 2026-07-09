@@ -2,8 +2,6 @@
 
 本地知识库引擎 CLI：基于 grafeo 的语义检索 + 图查询 + 文件 hash 跟踪。
 
-完整规范见 `xd-spec/specs/Tools/KB/xd-kb-cli/spec.md`。
-
 ## 配置
 
 复制 `.env.example` 为 `.env` 并填入 OpenAI 兼容 embedding API 的访问参数：
@@ -30,6 +28,7 @@ XD_KB_MAX_CHUNK_CHARS=8192
 
 | Model | dim |
 |---|---|
+| voyage-context-4 | 1024（支持 256/512/1024/2048） |
 | voyage-4-large | 1024 |
 | text-embedding-3-small | 1536 |
 | text-embedding-3-large | 3072 |
@@ -44,6 +43,19 @@ XD_KB_MAX_CHUNK_CHARS=8192
 | text-embedding-3 系列 | 8191 | ≤ 3000（中文 OpenAI tokenizer 偏耗 token） |
 
 默认 8192 是 voyage 优先的中庸值，换其他 model 时按上表自行调整；超限触发 4xx 时单文件回滚不污染数据，调小后重 ingest 即可。
+
+### 上下文化嵌入（voyage-context 系列）
+
+模型名含 `voyage-context`（如 `voyage/voyage-context-4`）时自动切换为上下文化 chunk 嵌入模式，无需额外配置：
+
+- **索引**：同一文档的全部 chunk 作为一组、一文档一请求送嵌（嵌套 `input` + `input_type: "document"`），每个 chunk 向量同时编码块内细节与全文上下文；`--batch-size` 在此模式下不生效。单文档累计字符超过安全预算（60K chars）时按 chunk 边界拆为多组、多请求（组间失去互相上下文）。此模式下 `XD_KB_MAX_CHUNK_CHARS` 不得超过 60000（启动时校验报错），否则单个 chunk 可能永远塞不进一次请求。
+- **防降级**：一文档一请求的响应必须是两层嵌套形态；若网关回退返回普通扁平嵌入（丢失上下文语义），xd-kb 直接报错拒绝入库，不会静默降级。
+- **并发**：`index --concurrency <n>`（默认 4）控制同时在飞的嵌入请求数；DB 写入始终串行有序，失败隔离粒度不变。一文档一请求会显著放大请求数（请求数 ≈ 文件数），全量重建大库时并发是主要提速手段。普通模型路径同样生效。
+- **查询**：自动携带 `input_type: "query"`。
+- **失败隔离**：粒度为单文档——某文档请求失败只影响该文件的 `vector_hash`，其余文件正常入库。
+- **切换模型必须重建**：contextualized 与普通模型的向量不在同一语义空间，切换后按下方 IndexConfig 防呆的指引换新 `--db` 全量重建。
+
+普通模型（模型名不含 `voyage-context`）行为不变：扁平 `input`、跨文件按 `--batch-size` 聚合。
 
 ### IndexConfig 防呆校验
 
@@ -73,6 +85,9 @@ XD_KB_MAX_CHUNK_CHARS=8192
 ```bash
 # 1. 把 markdown 目录建索引（首次或全量）
 xd-kb --db ./kb.db index ./docs --batch-size 50
+
+# 1a. 提高嵌入请求并发（默认 4；DB 写入始终串行有序）
+xd-kb --db ./kb.db index ./docs --concurrency 8
 
 # 2. 增量更新（仅处理新增 / 修改 / 删除的文件）
 xd-kb --db ./kb.db index ./docs --incremental

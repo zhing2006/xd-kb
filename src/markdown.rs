@@ -295,13 +295,9 @@ fn try_split_at_boundaries(
                 break;
             }
         }
-        match best {
-            Some(end) => {
-                pieces.push((cursor, end));
-                cursor = end;
-            }
-            None => return None,
-        }
+        let end = best?;
+        pieces.push((cursor, end));
+        cursor = end;
     }
 
     Some(pieces)

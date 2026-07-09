@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 
 use crate::config::{Config, KbConfig};
-use crate::embedding::{RetryConfig, embed_batch};
+use crate::embedding::{RetryConfig, embed_batch, embed_document, is_contextualized_model};
 use crate::markdown::{Chunk, ChunkLimits, process_file};
 use crate::storage::{ChunkInput, HashDim, KbStore};
 
@@ -16,7 +16,14 @@ pub type EmbedFut<'a> = Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + Sen
 /// Async embedding source. Production wraps the OpenAI-compatible HTTP client;
 /// tests can inject deterministic vectors without a network round-trip.
 pub trait Embedder: Send + Sync {
+    /// Flat batch embedding (ordinary models): one vector per text, texts
+    /// encoded independently.
     fn embed<'a>(&'a self, texts: &'a [String]) -> EmbedFut<'a>;
+    /// One document's chunks embedded together (contextualized models): one
+    /// vector per chunk, each carrying whole-document context.
+    fn embed_document<'a>(&'a self, chunks: &'a [String]) -> EmbedFut<'a>;
+    /// Whether the model needs per-document grouping (`voyage-context` family).
+    fn contextualized(&self) -> bool;
 }
 
 struct ApiEmbedder {
@@ -27,6 +34,12 @@ struct ApiEmbedder {
 impl Embedder for ApiEmbedder {
     fn embed<'a>(&'a self, texts: &'a [String]) -> EmbedFut<'a> {
         Box::pin(embed_batch(&self.cfg, &self.retry, texts))
+    }
+    fn embed_document<'a>(&'a self, chunks: &'a [String]) -> EmbedFut<'a> {
+        Box::pin(embed_document(&self.cfg, &self.retry, chunks))
+    }
+    fn contextualized(&self) -> bool {
+        is_contextualized_model(&self.cfg.model)
     }
 }
 
@@ -41,14 +54,12 @@ struct IndexStats {
     failed_files: HashSet<String>,
 }
 
-/// One chunk produced by `collect_phase`, tagged with the file it came from
-/// and that file's content hash. The chunking + embedding + storage layers all
-/// see chunks individually, but the per-batch failure-isolation contract needs
-/// to know "which file owns this chunk" so failed batches can flag the
-/// affected files for the FileHash phase.
-/// One chunk pointed at its owning file. The hash itself is held in
-/// `CollectResult::file_hashes` rather than inlined per chunk — N chunks of
-/// the same file would otherwise carry N copies of the same blake3 string.
+/// One chunk produced by `collect_phase`, tagged with its owning file — the
+/// failure-isolation contract needs "which file owns this chunk" so failed
+/// batches can flag the affected files for the FileHash phase. The file's
+/// content hash is held once in `CollectResult::file_hashes` rather than
+/// inlined per chunk — N chunks of the same file would otherwise carry N
+/// copies of the same blake3 string.
 struct CollectedChunk {
     file_path: String,
     chunk: Chunk,
@@ -90,6 +101,7 @@ pub async fn run(
     root: &Path,
     incremental: bool,
     batch_size: usize,
+    concurrency: usize,
     retry: &RetryConfig,
 ) -> Result<()> {
     let cfg = Config::from_env()?;
@@ -114,6 +126,7 @@ pub async fn run(
         root,
         incremental,
         batch_size,
+        concurrency,
         &limits,
         &embedder,
     )
@@ -129,11 +142,28 @@ async fn run_with_embedder(
     root: &Path,
     incremental: bool,
     batch_size: usize,
+    concurrency: usize,
     limits: &ChunkLimits,
     embedder: &dyn Embedder,
 ) -> Result<()> {
     if batch_size == 0 {
         bail!("batch_size must be >= 1");
+    }
+    if concurrency == 0 {
+        bail!("concurrency must be >= 1");
+    }
+
+    // Contextualized grouping splits oversized documents at CHUNK boundaries,
+    // so a single chunk larger than the request budget could never be split
+    // further and would be sent to the API doomed to fail. The chunker caps
+    // every chunk at max_chunk_chars — enforcing the budget here makes the
+    // oversized-single-chunk case unrepresentable instead of a remote 4xx.
+    if embedder.contextualized() && max_chunk_chars as usize > CONTEXTUALIZED_REQUEST_CHAR_BUDGET {
+        bail!(
+            "XD_KB_MAX_CHUNK_CHARS={max_chunk_chars} exceeds the contextualized per-request \
+             char budget ({CONTEXTUALIZED_REQUEST_CHAR_BUDGET}); lower it so single chunks \
+             always fit one request"
+        );
     }
 
     // Phase 1 — Collect: walk disk, validate IndexConfig, drop unchanged
@@ -176,7 +206,14 @@ async fn run_with_embedder(
     }
 
     // Phase 2 — Embed & Write per batch.
-    let ew = embed_and_write_phase(&collect.global_chunks, embedder, store, batch_size).await;
+    let ew = embed_and_write_phase(
+        &collect.global_chunks,
+        embedder,
+        store,
+        batch_size,
+        concurrency,
+    )
+    .await;
 
     // Phase 3 — FileHash mark: write vector_hash only for files whose chunks
     // all landed.
@@ -374,22 +411,74 @@ fn collect_chunks_for_file(content: &str, rel_path: &str, limits: &ChunkLimits) 
     process_file(content, rel_path, limits)
 }
 
+/// Character budget per contextualized request. The API caps one request at
+/// 120K tokens; Chinese text can approach ~1.5 tokens per char, so 60K chars
+/// keeps worst-case requests safely under the cap. Documents exceeding the
+/// budget are split at chunk boundaries into consecutive groups — groups lose
+/// cross-group context, an accepted degradation for oversized documents.
+const CONTEXTUALIZED_REQUEST_CHAR_BUDGET: usize = 60_000;
+
+/// Split the flat (file-ordered) chunk list into per-document request groups:
+/// one group per file, further split when a file's accumulated chunk chars
+/// exceed `char_budget`. Relies on `collect_phase` keeping same-file chunks
+/// contiguous and in document order.
+fn contextualized_groups(
+    global_chunks: &[CollectedChunk],
+    char_budget: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    let mut chars = 0usize;
+    for (i, cc) in global_chunks.iter().enumerate() {
+        let new_file = i > 0 && cc.file_path != global_chunks[i - 1].file_path;
+        let c = cc.chunk.content.chars().count();
+        if i > start && (new_file || chars + c > char_budget) {
+            groups.push(start..i);
+            start = i;
+            chars = 0;
+        }
+        chars += c;
+    }
+    if start < global_chunks.len() {
+        groups.push(start..global_chunks.len());
+    }
+    groups
+}
+
 /// Phase 2: per-batch embed + write. Each batch is its own grafeo session
 /// transaction. A batch failure is captured into `EmbedWriteResult` and the
 /// loop advances to the next batch — failure does NOT short-circuit run.
+///
+/// Batch unit depends on the model family:
+/// - ordinary models: `batch_size` chunks, cross-file aggregation allowed;
+/// - contextualized models: one same-file request group per batch — the whole
+///   document unless split by the char budget. Files never mix, so failure
+///   isolation stays at single-file granularity.
 async fn embed_and_write_phase(
     global_chunks: &[CollectedChunk],
     embedder: &dyn Embedder,
     store: &KbStore,
     batch_size: usize,
+    concurrency: usize,
 ) -> EmbedWriteResult {
+    use futures::StreamExt;
+
     let mut result = EmbedWriteResult::default();
 
     if global_chunks.is_empty() {
         return result;
     }
 
-    let total_batches = global_chunks.len().div_ceil(batch_size);
+    let contextualized = embedder.contextualized();
+    let batches: Vec<&[CollectedChunk]> = if contextualized {
+        contextualized_groups(global_chunks, CONTEXTUALIZED_REQUEST_CHAR_BUDGET)
+            .into_iter()
+            .map(|r| &global_chunks[r])
+            .collect()
+    } else {
+        global_chunks.chunks(batch_size).collect()
+    };
+    let total_batches = batches.len();
     // Tracks "this run has already COMMITTED a clear for file F". Updated only
     // after `append_chunks_batch` succeeds, so a failed batch never marks F as
     // cleared. The next batch that touches F will then still issue the
@@ -397,7 +486,28 @@ async fn embed_and_write_phase(
     // for any file removes its stale `:Chunk` rows in the same transaction.
     let mut cleared_files: HashSet<String> = HashSet::new();
 
-    for (idx, batch_slice) in global_chunks.chunks(batch_size).enumerate() {
+    // Up to `concurrency` embedding requests in flight; `buffered` yields
+    // results in batch order, so the write side below stays strictly serial
+    // and ordered — the `cleared_files` commit protocol and every failure-
+    // isolation guarantee are identical to the sequential implementation.
+    let embed_stream = futures::stream::iter(batches.into_iter().enumerate().map(
+        move |(idx, batch_slice)| async move {
+            let inputs: Vec<String> = batch_slice
+                .iter()
+                .map(|cc| cc.chunk.content.clone())
+                .collect();
+            let res = if contextualized {
+                embedder.embed_document(&inputs).await
+            } else {
+                embedder.embed(&inputs).await
+            };
+            (idx, batch_slice, res)
+        },
+    ))
+    .buffered(concurrency.max(1));
+    let mut embed_stream = std::pin::pin!(embed_stream);
+
+    while let Some((idx, batch_slice, embed_res)) = embed_stream.next().await {
         let i = idx + 1;
         eprintln!("{}", fmt_embedding_batch(i, total_batches));
 
@@ -412,12 +522,7 @@ async fn embed_and_write_phase(
             }
         }
 
-        let inputs: Vec<String> = batch_slice
-            .iter()
-            .map(|cc| cc.chunk.content.clone())
-            .collect();
-
-        let vectors = match embedder.embed(&inputs).await {
+        let vectors = match embed_res {
             Ok(v) => v,
             Err(e) => {
                 let files: HashSet<String> =
@@ -625,6 +730,7 @@ mod tests {
             root,
             incremental,
             50,
+            4,
             &limits,
             embedder,
         )
@@ -639,7 +745,19 @@ mod tests {
         // Lets tests pin the exact embedding input (e.g. that it does NOT
         // contain a heading-path prefix duplicated ahead of the content).
         seen_texts: Mutex<Vec<String>>,
+        // One entry per `embed_document` call: that call's chunk list. Lets
+        // contextualized tests pin the per-document grouping exactly.
+        seen_doc_calls: Mutex<Vec<Vec<String>>>,
         fail_on: Option<String>,
+        contextualized: bool,
+        // In-flight tracking across respond() entry → exit. Arc because the
+        // returned future is 'static and outlives the &self borrow.
+        in_flight: Arc<Mutex<usize>>,
+        max_in_flight: Arc<Mutex<usize>>,
+        // Insert one yield point before responding so the buffered stream can
+        // actually stack requests in flight — without it every fake request
+        // completes on first poll and max_in_flight would never exceed 1.
+        yield_in_respond: bool,
     }
 
     impl FakeEmbedder {
@@ -648,47 +766,111 @@ mod tests {
                 dim,
                 calls: Mutex::new(0),
                 seen_texts: Mutex::new(Vec::new()),
+                seen_doc_calls: Mutex::new(Vec::new()),
                 fail_on: None,
+                contextualized: false,
+                in_flight: Arc::new(Mutex::new(0)),
+                max_in_flight: Arc::new(Mutex::new(0)),
+                yield_in_respond: false,
             }
         }
         fn failing(dim: usize, fail_substring: &str) -> Self {
             Self {
-                dim,
-                calls: Mutex::new(0),
-                seen_texts: Mutex::new(Vec::new()),
                 fail_on: Some(fail_substring.to_string()),
+                ..Self::new(dim)
+            }
+        }
+        fn ctx(dim: usize) -> Self {
+            Self {
+                contextualized: true,
+                ..Self::new(dim)
+            }
+        }
+        fn ctx_failing(dim: usize, fail_substring: &str) -> Self {
+            Self {
+                contextualized: true,
+                fail_on: Some(fail_substring.to_string()),
+                ..Self::new(dim)
+            }
+        }
+        fn ctx_yielding(dim: usize) -> Self {
+            Self {
+                contextualized: true,
+                yield_in_respond: true,
+                ..Self::new(dim)
             }
         }
         fn call_count(&self) -> usize {
             *self.calls.lock().unwrap()
         }
+        fn max_in_flight(&self) -> usize {
+            *self.max_in_flight.lock().unwrap()
+        }
         fn seen_texts(&self) -> Vec<String> {
             self.seen_texts.lock().unwrap().clone()
+        }
+        fn seen_doc_calls(&self) -> Vec<Vec<String>> {
+            self.seen_doc_calls.lock().unwrap().clone()
+        }
+
+        fn respond(&self, texts: &[String]) -> EmbedFut<'static> {
+            let dim = self.dim;
+            let fail_on = self.fail_on.clone();
+            let texts_owned: Vec<String> = texts.to_vec();
+            let in_flight = Arc::clone(&self.in_flight);
+            let max_in_flight = Arc::clone(&self.max_in_flight);
+            let yield_first = self.yield_in_respond;
+            Box::pin(async move {
+                {
+                    let mut cur = in_flight.lock().unwrap();
+                    *cur += 1;
+                    let mut max = max_in_flight.lock().unwrap();
+                    if *cur > *max {
+                        *max = *cur;
+                    }
+                }
+                if yield_first {
+                    tokio::task::yield_now().await;
+                }
+                let out = if let Some(needle) = fail_on
+                    && texts_owned.iter().any(|t| t.contains(&needle))
+                {
+                    Err(anyhow::anyhow!(
+                        "FakeEmbedder: forced failure on `{needle}`"
+                    ))
+                } else {
+                    Ok(texts_owned
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| fake_vec(i as f32 * 0.1, dim))
+                        .collect())
+                };
+                *in_flight.lock().unwrap() -= 1;
+                out
+            })
         }
     }
 
     impl Embedder for FakeEmbedder {
         fn embed<'a>(&'a self, texts: &'a [String]) -> EmbedFut<'a> {
-            let dim = self.dim;
-            let fail_on = self.fail_on.clone();
-            let texts_owned: Vec<String> = texts.to_vec();
             *self.calls.lock().unwrap() += 1;
             self.seen_texts
                 .lock()
                 .unwrap()
-                .extend(texts_owned.iter().cloned());
-            Box::pin(async move {
-                if let Some(needle) = fail_on
-                    && texts_owned.iter().any(|t| t.contains(&needle))
-                {
-                    anyhow::bail!("FakeEmbedder: forced failure on `{needle}`");
-                }
-                Ok(texts_owned
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| fake_vec(i as f32 * 0.1, dim))
-                    .collect())
-            })
+                .extend(texts.iter().cloned());
+            self.respond(texts)
+        }
+        fn embed_document<'a>(&'a self, chunks: &'a [String]) -> EmbedFut<'a> {
+            *self.calls.lock().unwrap() += 1;
+            self.seen_texts
+                .lock()
+                .unwrap()
+                .extend(chunks.iter().cloned());
+            self.seen_doc_calls.lock().unwrap().push(chunks.to_vec());
+            self.respond(chunks)
+        }
+        fn contextualized(&self) -> bool {
+            self.contextualized
         }
     }
 
@@ -728,6 +910,7 @@ mod tests {
             &root,
             false,
             50,
+            4,
             &limits,
             &embedder,
         )
@@ -856,6 +1039,7 @@ mod tests {
             &root,
             false,
             1,
+            4,
             &limits,
             &embedder,
         )
@@ -909,6 +1093,7 @@ mod tests {
             &root,
             false,
             1, // one chunk per batch so failures isolate to single chunks
+            4,
             &limits,
             &embedder,
         )
@@ -951,6 +1136,7 @@ mod tests {
             &root,
             false,
             100,
+            4,
             &limits,
             &embedder,
         )
@@ -1006,6 +1192,7 @@ mod tests {
             &root,
             false,
             1,
+            4,
             &test_limits(),
             &failing,
         )
@@ -1041,6 +1228,7 @@ mod tests {
             &root,
             true,
             1,
+            4,
             &test_limits(),
             &healthy,
         )
@@ -1094,6 +1282,7 @@ mod tests {
             &root,
             false,
             1,
+            4,
             &test_limits(),
             &embedder,
         )
@@ -1169,6 +1358,7 @@ mod tests {
             &root,
             true,
             1,
+            4,
             &test_limits(),
             &failing,
         )
@@ -1327,6 +1517,7 @@ mod tests {
             &root,
             false,
             50,
+            4,
             &limits,
             &embedder,
         )
@@ -1373,6 +1564,7 @@ mod tests {
             &root,
             false,
             50,
+            4,
             &limits,
             &embedder,
         )
@@ -1406,6 +1598,7 @@ mod tests {
             &root,
             false,
             50,
+            4,
             &limits,
             &embedder,
         )
@@ -1441,6 +1634,7 @@ mod tests {
             &root,
             false,
             50,
+            4,
             &limits_8192,
             &embedder,
         )
@@ -1456,6 +1650,7 @@ mod tests {
             &root,
             false,
             50,
+            4,
             &limits_2048,
             &embedder,
         )
@@ -1492,6 +1687,7 @@ mod tests {
             &root,
             false,
             50,
+            4,
             &limits,
             &embedder,
         )
@@ -1526,6 +1722,7 @@ mod tests {
             &root,
             false,
             50,
+            4,
             &limits,
             &embedder_1536,
         )
@@ -1547,6 +1744,7 @@ mod tests {
             &root,
             false,
             50,
+            4,
             &limits,
             &embedder_1024,
         )
@@ -1591,6 +1789,7 @@ mod tests {
                         &root,
                         false,
                         50,
+                        4,
                         &crate::embedding::RetryConfig::default(),
                     )
                     .await
@@ -1935,6 +2134,7 @@ mod tests {
             &root,
             false,
             1,
+            4,
             &limits,
             &embedder,
         )
@@ -1998,5 +2198,287 @@ mod tests {
             other => panic!("unexpected count value: {other:?}"),
         };
         assert_eq!(chunk_count, 0);
+    }
+
+    // ---- contextualized embedding (voyage-context family) ----
+
+    /// Intent Doc scenario "contextualized 索引": one request per document,
+    /// carrying exactly that document's chunks in document order —
+    /// batch_size must NOT flatten documents together.
+    #[tokio::test]
+    async fn contextualized_one_document_per_request() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        write_md(&root, "世界观/A.md", &worldview_doc("A", "alpha"));
+        write_md(&root, "世界观/B.md", &worldview_doc("B", "bravo"));
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::ctx(TEST_DIM);
+        // batch_size=100 would collapse A+B into one call for ordinary
+        // models — contextualized mode must still issue one call per file.
+        run_default(&store, "voyage-context-fake", &root, false, &embedder)
+            .await
+            .unwrap();
+
+        let doc_calls = embedder.seen_doc_calls();
+        assert_eq!(
+            doc_calls.len(),
+            2,
+            "one embed_document call per file expected, got {doc_calls:?}"
+        );
+        let limits = test_limits();
+        for (rel, body) in [
+            ("世界观/A.md", worldview_doc("A", "alpha")),
+            ("世界观/B.md", worldview_doc("B", "bravo")),
+        ] {
+            let expected: Vec<String> = process_file(&body, rel, &limits)
+                .iter()
+                .map(|c| c.content.clone())
+                .collect();
+            assert!(
+                doc_calls.contains(&expected),
+                "one call must carry {rel}'s chunks verbatim in order"
+            );
+            assert!(store.get_file_hash(rel, HashDim::Vector).unwrap().is_some());
+        }
+    }
+
+    /// Intent Doc scenario "单文档失败隔离": a failed document request marks
+    /// only that file; other documents land normally.
+    #[tokio::test]
+    async fn contextualized_doc_failure_isolated_to_single_file() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        write_md(&root, "世界观/Good.md", &worldview_doc("Good", "ok"));
+        write_md(
+            &root,
+            "世界观/Bad.md",
+            &worldview_doc("Bad", "this contains MAGIC_FAIL token"),
+        );
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::ctx_failing(TEST_DIM, "MAGIC_FAIL");
+        let res = run_default(&store, "voyage-context-fake", &root, false, &embedder).await;
+        assert!(res.is_err(), "run MUST exit non-zero when a document fails");
+
+        assert!(
+            store
+                .get_file_hash("世界观/Good.md", HashDim::Vector)
+                .unwrap()
+                .is_some(),
+            "Good.md must land — its own request succeeded"
+        );
+        assert!(
+            store
+                .get_file_hash("世界观/Bad.md", HashDim::Vector)
+                .unwrap()
+                .is_none(),
+            "Bad.md must NOT land — its request failed"
+        );
+    }
+
+    /// Intent Doc scenario "超大文档拆分" (grouping unit): a document whose
+    /// accumulated chars exceed the budget splits at chunk boundaries into
+    /// consecutive groups; small documents stay whole; files never mix.
+    #[test]
+    fn contextualized_groups_split_on_budget_and_file_boundary() {
+        let mk = |file: &str, content: &str| CollectedChunk {
+            file_path: file.to_string(),
+            chunk: Chunk {
+                content: content.to_string(),
+                line_start: 1,
+                line_end: 1,
+                prefix: String::new(),
+            },
+        };
+        let chunks = vec![
+            mk("a.md", "0123456789"), // 10 chars
+            mk("a.md", "0123456789"),
+            mk("a.md", "0123456789"),
+            mk("b.md", "01234"), // small doc, stays whole
+            mk("b.md", "01234"),
+        ];
+
+        // Budget 20: a.md (30 chars) splits 2+1; b.md (10 chars) stays whole.
+        let groups = contextualized_groups(&chunks, 20);
+        assert_eq!(groups, vec![0..2, 2..3, 3..5]);
+
+        // Budget large enough: exactly one group per file.
+        let groups = contextualized_groups(&chunks, 60_000);
+        assert_eq!(groups, vec![0..3, 3..5]);
+
+        // Empty input: no groups.
+        assert!(contextualized_groups(&[], 100).is_empty());
+    }
+
+    /// End-to-end: a document whose chunks together exceed the production
+    /// char budget MUST be split into MULTIPLE contextualized requests, and
+    /// still land every chunk + write vector_hash (all groups succeeded).
+    /// Would fail if `embed_and_write_phase` stopped honouring the grouping.
+    #[tokio::test]
+    async fn contextualized_oversized_doc_lands_all_chunks_across_requests() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        // 概述 body of 70K chars → split_oversized cuts it into ~9 chunks of
+        // ≤ 8192 chars; total chars > CONTEXTUALIZED_REQUEST_CHAR_BUDGET (60K)
+        // forces contextualized_groups to emit ≥ 2 groups for this one file.
+        let body = worldview_doc("Big", &"长句内容。".repeat(14_000));
+        write_md(&root, "世界观/Big.md", &body);
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::ctx(TEST_DIM);
+        run_default(&store, "voyage-context-fake", &root, false, &embedder)
+            .await
+            .unwrap();
+
+        let doc_calls = embedder.seen_doc_calls();
+        assert!(
+            doc_calls.len() >= 2,
+            "oversized doc must split into multiple contextualized requests, got {}",
+            doc_calls.len()
+        );
+
+        let limits = test_limits();
+        let expected = process_file(&body, "世界观/Big.md", &limits).len();
+        assert!(expected >= 2, "precondition: doc must produce many chunks");
+        let landed: usize = doc_calls.iter().map(|c| c.len()).sum();
+        assert_eq!(
+            landed, expected,
+            "groups must cover every chunk exactly once"
+        );
+        let qres = store
+            .execute_raw("MATCH (c:Chunk {file_path: '世界观/Big.md'}) RETURN count(c)")
+            .unwrap();
+        let n = match &qres.rows()[0][0] {
+            grafeo::Value::Int64(n) => *n,
+            other => panic!("unexpected count: {other:?}"),
+        };
+        assert_eq!(n as usize, expected, "every chunk must land");
+        assert!(
+            store
+                .get_file_hash("世界观/Big.md", HashDim::Vector)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Guard: contextualized mode refuses to start when XD_KB_MAX_CHUNK_CHARS
+    /// exceeds the per-request char budget — a single chunk could then never
+    /// fit one request and would fail remotely instead of locally.
+    #[tokio::test]
+    async fn contextualized_rejects_max_chunk_chars_above_budget() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        write_md(&root, "世界观/A.md", &worldview_doc("A", "alpha"));
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::ctx(TEST_DIM);
+        let over = (CONTEXTUALIZED_REQUEST_CHAR_BUDGET + 1) as u32;
+        let limits = ChunkLimits { max_chars: over };
+        let res = run_with_embedder(
+            &store,
+            "voyage-context-fake",
+            TEST_DIM,
+            over,
+            &root,
+            false,
+            50,
+            4,
+            &limits,
+            &embedder,
+        )
+        .await;
+        let err = res.expect_err("must reject max_chunk_chars above budget");
+        let msg = format!("{err}");
+        assert!(msg.contains("XD_KB_MAX_CHUNK_CHARS"), "got: {msg}");
+        assert_eq!(embedder.call_count(), 0, "no API call may be attempted");
+
+        // Ordinary models are unaffected by the budget guard.
+        let plain = FakeEmbedder::new(TEST_DIM);
+        run_with_embedder(
+            &store,
+            "fake-model",
+            TEST_DIM,
+            over,
+            &root,
+            false,
+            50,
+            4,
+            &limits,
+            &plain,
+        )
+        .await
+        .expect("ordinary model path must not enforce the contextualized budget");
+    }
+    #[tokio::test]
+    async fn concurrency_caps_in_flight_requests() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("kb.db");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..6 {
+            write_md(
+                &root,
+                &format!("d{i}.md"),
+                &format!("# D{i}\n\n正文内容 {i}。\n"),
+            );
+        }
+
+        let store = KbStore::open(&db).unwrap();
+        let embedder = FakeEmbedder::ctx_yielding(TEST_DIM);
+        let limits = test_limits();
+        run_with_embedder(
+            &store,
+            "voyage-context-fake",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            false,
+            50,
+            3,
+            &limits,
+            &embedder,
+        )
+        .await
+        .expect("indexing should succeed");
+
+        assert_eq!(embedder.call_count(), 6, "one request per document");
+        assert_eq!(
+            embedder.max_in_flight(),
+            3,
+            "peak in-flight requests must equal --concurrency"
+        );
+
+        // concurrency=1 degrades to the strictly serial behaviour.
+        let db2 = tmp.path().join("kb2.db");
+        let store2 = KbStore::open(&db2).unwrap();
+        let serial = FakeEmbedder::ctx_yielding(TEST_DIM);
+        run_with_embedder(
+            &store2,
+            "voyage-context-fake",
+            TEST_DIM,
+            TEST_MAX_CHUNK_CHARS,
+            &root,
+            false,
+            50,
+            1,
+            &limits,
+            &serial,
+        )
+        .await
+        .expect("indexing should succeed");
+        assert_eq!(
+            serial.max_in_flight(),
+            1,
+            "--concurrency 1 must stay serial"
+        );
     }
 }
