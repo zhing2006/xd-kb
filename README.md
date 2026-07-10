@@ -66,13 +66,16 @@ XD_KB_MAX_CHUNK_CHARS=8192
 - 换一个新的 `--db` 路径（推荐：旧库可保留对照）
 - 对原 DB 做 force-rebuild（清掉旧数据后重新 `index`）
 
-### 迁移提示
+### IndexConfig 初始化说明
 
-当前尚未生成生产库，本次直接以默认值 `XD_KB_DIM=1024` / `XD_KB_MAX_CHUNK_CHARS=8192` 落地，无需 backfill。
+生产库按默认值 `XD_KB_DIM=1024` / `XD_KB_MAX_CHUNK_CHARS=8192` 建立，无需 backfill。
 
 ## 子命令
 
-所有子命令必须接收一个全局参数：`--db <path>`（grafeo DB 目录）。每个 DB 路径就是一个独立的 KB，不同 KB 之间通过不同 `--db` 路径做物理隔离。
+所有子命令必须接收一个全局参数：`--db <path>`。每个 DB 路径就是一个独立的 KB，不同 KB 之间通过不同 `--db` 路径做物理隔离。路径支持两种存储格式：
+
+- **单文件（推荐）**：`.grafeo` 扩展名（如 `.kb/wiki.grafeo`）。新路径带该扩展名即自动以单文件格式创建；close 时 checkpoint 全量落盘并清除 sidecar WAL，文件尺寸稳定。
+- **WAL 目录（旧格式）**：目录路径（如 `.kb/wiki.db`）。日志只增不减、无 compaction，目录随写入持续膨胀；检测到该格式时除 `migrate` 外的命令会在 stderr 提示用 `migrate` 转换（详见下方 migrate 章节）。
 
 全局可选参数（控制 embedding HTTP 请求的指数退避）：
 
@@ -84,36 +87,51 @@ XD_KB_MAX_CHUNK_CHARS=8192
 
 ```bash
 # 1. 把 markdown 目录建索引（首次或全量）
-xd-kb --db ./kb.db index ./docs --batch-size 50
+xd-kb --db ./kb.grafeo index ./docs --batch-size 50
 
 # 1a. 提高嵌入请求并发（默认 4；DB 写入始终串行有序）
-xd-kb --db ./kb.db index ./docs --concurrency 8
+xd-kb --db ./kb.grafeo index ./docs --concurrency 8
 
 # 2. 增量更新（仅处理新增 / 修改 / 删除的文件）
-xd-kb --db ./kb.db index ./docs --incremental
+xd-kb --db ./kb.grafeo index ./docs --incremental
 
 # 3. 语义查询（默认 cosine top-N）
-xd-kb --db ./kb.db query "异步任务" --top 5
+xd-kb --db ./kb.grafeo query "异步任务" --top 5
 
 # 3a. 语义查询 + 完整 chunk 输出（LLM Agent / RAG 默认开启，免再发 Read 取完整内容）
-xd-kb --db ./kb.db query "异步任务" --top 5 --full
+xd-kb --db ./kb.grafeo query "异步任务" --top 5 --full
 
 # 4. 语义查询 + MMR 多样性（lambda < 1.0 触发 MMR；越小越偏多样性）
-xd-kb --db ./kb.db query "异步任务" --top 5 --lambda 0.5
-xd-kb --db ./kb.db query "异步任务" --top 5 --lambda 0.3 --fetch-pool 40
+xd-kb --db ./kb.grafeo query "异步任务" --top 5 --lambda 0.5
+xd-kb --db ./kb.grafeo query "异步任务" --top 5 --lambda 0.3 --fetch-pool 40
 
 # 5. 原生 GQL（语句原样转发，CLI 不注入任何谓词）
-xd-kb --db ./kb.db gql "MATCH (c:Chunk) RETURN c.file_path LIMIT 10"
+xd-kb --db ./kb.grafeo gql "MATCH (c:Chunk) RETURN c.file_path LIMIT 10"
 
 # 6. 检查文件 hash 状态（new / unchanged / modified / deleted）
 #    --type 必填，9 个合法取值（kebab-case）：
 #      vector / graph / llm / fulltext / summary / entity / vector-2 / custom / custom-2
-xd-kb --db ./kb.db check ./docs/x.md --type vector
-xd-kb --db ./kb.db check ./docs/x.md --type vector --mark
+xd-kb --db ./kb.grafeo check ./docs/x.md --type vector
+xd-kb --db ./kb.grafeo check ./docs/x.md --type vector --mark
 
 # 7. check 配合 --root：让写入的 :FileHash.path 与 index 的 :Chunk.file_path 对齐
-xd-kb --db ./kb.db check --root Wiki/example-kb 故事/X.md --type graph --mark
+xd-kb --db ./kb.grafeo check --root Wiki/example-kb 故事/X.md --type graph --mark
+
+# 8. 旧 WAL 目录库迁移到单文件格式（纯本地拷贝，不触发任何 embedding 请求）
+xd-kb --db ./kb.db migrate
+xd-kb --db ./kb.db migrate --target ./elsewhere/kb.grafeo
 ```
+
+### migrate：迁移单文件存储格式
+
+`migrate` 把旧 WAL 目录格式的 KB 完整复制为单文件 `.grafeo` 格式：
+
+- **拷贝范围**：全部节点（标签 + 全部属性，embedding 向量原样搬运）与全部边——`:Chunk` / `:FileHash`（9 维 hash）/ `:IndexConfig` / 图数据一个不落；全程零网络请求、零重新 embedding。
+- **目标路径**：缺省为 `--db` 路径换 `.grafeo` 扩展名（`.kb/wiki.db` → `.kb/wiki.grafeo`），可用 `--target` 覆盖；目标必须带小写 `.grafeo` 扩展名（grafeo 按扩展名大小写敏感地分派单文件格式），且不能位于源库目录内部。
+- **失败安全**：先写同目录隐藏临时文件（文件名含进程 pid），节点数 / 边数 / Chunk 数 / FileHash 数四项校验全部一致后才以原子 no-clobber 方式发布（目标在拷贝期间被他人创建则失败而不覆盖）；任何一步失败旧库原样不动、临时产物（含 grafeo 的 `.wal` / `.spill` sidecar）自动清理；旧目录改名 `.bak` 是提交点，越过后仅剩的清理动作（如锁文件删除）失败只在 stderr 告警，不影响迁移成功。迁移全程持有 `<db>.migrate-lock` 锁文件（按规范化路径生成，符号链接别名共享同一把锁）：并发 migrate 互斥，其它 xd-kb 命令检测到锁也会拒绝打开该库。仅内容形似 grafeo WAL 目录（含 `wal/wal_<数字>.log` 段文件）的路径才会被迁移，误传普通目录直接报错不动。
+- **旧库处置**：迁移成功后旧目录改名为 `<原名>.bak` 保留，确认新库正常后手动删除。
+- **收益**：WAL 历史全部压缩掉（一次全量重建后 110MB 的目录迁移后显著缩小），后续写入 close 时原位 checkpoint，尺寸不再单调增长。
+- **限制**：HNSW 向量索引不迁移也不预建——grafeo 0.5.x 的单文件 checkpoint 虽会写入索引拓扑，但 open 时的加载路径丢弃索引定义、拓扑被无声跳过（上游 bug），预建只会白占文件空间。query 仍按每进程重建（见下），行为与迁移前一致；上游修复后可在 index/migrate 收尾一次性建索引。
 
 ### `.xd-kb.yaml` 配置（index 子命令）
 
@@ -161,7 +179,7 @@ exclude:
 
 `--lambda` 取值范围 `[0.0, 1.0]` 闭区间，越界（含 `--lambda -0.1` 这种空格分隔的负值）一律以非零退出码 + `--lambda must be in [0.0, 1.0]` 错误信息退出。
 
-向量索引（HNSW）不随 DB 目录持久化（grafeo 目录格式限制）：`index` 子命令只写节点数据、不构建索引；`query` 每个进程启动时从节点数据重建一次（约 1ms/chunk，数千 chunk 的库约数秒），同进程内多次检索共享这一次构建。
+向量索引（HNSW）不跨进程持久化——WAL 目录格式天生不落盘索引；单文件格式受 grafeo 0.5.x 上游 bug 限制（checkpoint 写入拓扑但 open 不加载），两种格式行为一致：`index` / `migrate` 只写节点数据、不构建索引；`query` 每个进程启动时从节点数据重建一次（约 1ms/chunk，数千 chunk 的库约数秒），同进程内多次检索共享这一次构建。
 
 `--full` 控制每条命中的 `content` 字段渲染：缺省（紧凑）只取首行并截断到 120 字符，便于人眼浏览；`--full` 原样输出完整 chunk content（保留所有换行、每行 4 空格缩进、命中之间用一个空行分隔），其他列（序号、相似度分数、`<file>:<start>-<end>` 头）不变。LLM Agent / RAG 调用方应默认开启，避免再发 Read 取完整 chunk。
 

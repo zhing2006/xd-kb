@@ -4,6 +4,7 @@ mod embedding;
 mod gql;
 mod index;
 mod markdown;
+mod migrate;
 mod query;
 mod storage;
 
@@ -63,8 +64,10 @@ fn resolve_fetch_pool(top: usize, fetch_pool: Option<usize>) -> Result<usize> {
     about = "Local knowledge-base engine: semantic search + GQL + file-hash tracking, backed by grafeo. One DB path = one KB."
 )]
 struct Cli {
-    /// Path to the grafeo database directory (created if missing). Each DB is one KB;
-    /// run separate `--db` paths for separate knowledge bases.
+    /// Path to the grafeo database: a single-file KB (`.grafeo`, preferred)
+    /// or a legacy WAL-directory KB. Created if missing (a new `.grafeo`
+    /// path creates single-file format). Each DB is one KB; run separate
+    /// `--db` paths for separate knowledge bases.
     #[arg(long)]
     db: PathBuf,
 
@@ -164,12 +167,50 @@ enum Commands {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Migrate a WAL-directory KB to the single-file .grafeo format.
+    /// Copies all nodes/edges/vectors verbatim (no re-embedding, no index
+    /// build), verifies counts, renames the old directory to `<db>.bak`.
+    Migrate {
+        /// Target .grafeo file. Defaults to the --db path with its extension
+        /// replaced by `.grafeo` (e.g. .kb/wiki.db -> .kb/wiki.grafeo).
+        #[arg(long)]
+        target: Option<PathBuf>,
+    },
+}
+
+/// True when the CLI should suggest migrating: the KB is still in the legacy
+/// WAL-directory format (its log grows unboundedly) and the user isn't
+/// already running `migrate`.
+fn should_hint_migration(db_is_dir: bool, command: &Commands) -> bool {
+    db_is_dir && !matches!(command, Commands::Migrate { .. })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
+
+    if should_hint_migration(cli.db.is_dir(), &cli.command) {
+        eprintln!(
+            "note: {} is a WAL-directory KB whose log only ever grows; \
+             run `xd-kb --db {} migrate` to convert it to single-file .grafeo format",
+            cli.db.display(),
+            cli.db.display()
+        );
+    }
+
+    // A migration lock means another process is rewriting this KB right now;
+    // opening it mid-swap could read (or write into) a directory about to be
+    // renamed away. `migrate` itself handles the lock via create_new.
+    let migrate_lock = migrate::lock_path(&cli.db);
+    if migrate_lock.exists() && !matches!(cli.command, Commands::Migrate { .. }) {
+        bail!(
+            "a migration of {} appears to be in progress (lock file {} exists) — \
+             wait for it to finish, or remove the stale lock if none is running",
+            cli.db.display(),
+            migrate_lock.display()
+        );
+    }
 
     let retry_config = RetryConfig {
         backoff_base: cli.backoff_base,
@@ -211,6 +252,7 @@ async fn main() -> Result<()> {
             dim,
             root,
         } => check::run(&cli.db, &file, dim, mark, root.as_deref()),
+        Commands::Migrate { target } => migrate::run(&cli.db, target),
     }
 }
 
@@ -220,6 +262,43 @@ mod tests {
 
     fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn migration_hint_fires_for_dir_kb_except_migrate() {
+        let query = try_parse(&["xd-kb", "--db", "./kb.db", "query", "x"])
+            .unwrap()
+            .command;
+        let migrate = try_parse(&["xd-kb", "--db", "./kb.db", "migrate"])
+            .unwrap()
+            .command;
+        assert!(should_hint_migration(true, &query));
+        assert!(!should_hint_migration(true, &migrate));
+        assert!(
+            !should_hint_migration(false, &query),
+            "single-file KB: no hint"
+        );
+    }
+
+    #[test]
+    fn migrate_subcommand_parses_with_optional_target() {
+        let cli = try_parse(&["xd-kb", "--db", "./kb.db", "migrate"]).unwrap();
+        assert!(matches!(cli.command, Commands::Migrate { target: None }));
+        let cli = try_parse(&[
+            "xd-kb",
+            "--db",
+            "./kb.db",
+            "migrate",
+            "--target",
+            "./out.grafeo",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Migrate { target: Some(t) } => {
+                assert_eq!(t, PathBuf::from("./out.grafeo"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

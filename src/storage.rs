@@ -59,6 +59,23 @@ pub struct IndexConfig {
     pub max_chunk_chars: u32,
 }
 
+/// One node dumped for whole-DB copy (`migrate`): its old id, labels, and
+/// every property verbatim (embedding vectors included, as `Value::Vector`).
+pub struct DumpedNode {
+    pub id: i64,
+    pub labels: Vec<String>,
+    pub props: Vec<(String, Value)>,
+}
+
+/// One edge dumped for whole-DB copy (`migrate`): endpoint ids refer to
+/// `DumpedNode::id` values of the SOURCE database.
+pub struct DumpedEdge {
+    pub source: i64,
+    pub target: i64,
+    pub edge_type: String,
+    pub props: Vec<(String, Value)>,
+}
+
 /// Pipeline dim for `:FileHash` per-dim hash properties.
 ///
 /// CLI surface uses kebab-case (clap default): `vector` / `vector-2` / `custom-2`.
@@ -253,12 +270,15 @@ impl KbStore {
     /// [`Self::upsert_chunks_for_file`]); a mismatched-dim chunk fails fast
     /// with no DB state change.
     ///
-    /// This method does NOT touch the vector index. grafeo does not restore
-    /// the HNSW across process open/close for directory-format DBs (verified
-    /// empirically on 0.5.42), and grafeo's `create_vector_index` is a full
-    /// scan-and-rebuild — calling it per batch made indexing O(n²) in total
-    /// chunks. Search callers rebuild once per process instead (see
-    /// `ensure_chunk_vector_index`; the query pipeline does this).
+    /// This method does NOT touch the vector index. grafeo 0.5.42 cannot
+    /// restore an HNSW across process open/close in either storage format:
+    /// directory-format DBs never persist it, and single-file (`.grafeo`)
+    /// DBs checkpoint the topology but drop the index definitions on load
+    /// (upstream bug), so the section is silently skipped. grafeo's
+    /// `create_vector_index` is also a full scan-and-rebuild — calling it
+    /// per batch made indexing O(n²) in total chunks. Search callers rebuild
+    /// once per process instead (see `ensure_chunk_vector_index`; the query
+    /// pipeline does this).
     pub fn append_chunks_batch(
         &self,
         chunks: &[ChunkInput<'_>],
@@ -356,10 +376,8 @@ impl KbStore {
             }
         }
 
-        // Deliberately NO ensure_chunk_vector_index here — the rebuilt index
-        // would die with this process anyway (grafeo directory-format DBs do
-        // not restore the HNSW on reopen), and per-batch rebuilds are O(n²).
-        // Search paths rebuild once per process.
+        // Deliberately NO ensure_chunk_vector_index here — see the HNSW
+        // lifecycle note in this method's doc comment.
         Ok(())
     }
 
@@ -810,6 +828,142 @@ impl KbStore {
                 Err(e)
             }
         }
+    }
+
+    // ---------- Whole-DB dump/copy (migrate) ----------
+
+    /// Dump every node with labels and all properties. `MATCH (n) RETURN n`
+    /// yields each node as a `Value::Map` with reserved `_id` / `_labels`
+    /// keys alongside the properties; property values keep their storage
+    /// variant (embeddings stay `Value::Vector`). Only those two exact
+    /// reserved keys are stripped — user properties that merely start with
+    /// an underscore are data and must survive the dump. Loads the whole KB
+    /// into memory — fine at our < 100K-node-per-KB scale.
+    pub fn dump_all_nodes(&self) -> Result<Vec<DumpedNode>> {
+        let session = self.db.session();
+        let res = session
+            .execute("MATCH (n) RETURN n")
+            .map_err(|e| anyhow!("dump nodes: {e}"))?;
+        let mut out = Vec::with_capacity(res.row_count());
+        for row in res.rows() {
+            let Some(Value::Map(map)) = row.first() else {
+                bail!("dump nodes: expected a node map, got {:?}", row.first());
+            };
+            let id = match map.get("_id") {
+                Some(Value::Int64(v)) => *v,
+                other => bail!("dump nodes: bad _id {other:?}"),
+            };
+            let labels = match map.get("_labels") {
+                Some(Value::List(items)) => items
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => Ok(s.to_string()),
+                        other => Err(anyhow!("dump nodes: non-string label {other:?}")),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                other => bail!("dump nodes: bad _labels {other:?}"),
+            };
+            let props = map
+                .iter()
+                .filter(|(k, _)| !matches!(k.as_str(), "_id" | "_labels"))
+                .map(|(k, v)| (k.as_str().to_string(), v.clone()))
+                .collect();
+            out.push(DumpedNode { id, labels, props });
+        }
+        Ok(out)
+    }
+
+    /// Dump every edge with type and all properties. Edge maps carry
+    /// reserved `_id` / `_source` / `_target` / `_type` keys; only those
+    /// exact keys are stripped, underscore-prefixed user properties survive.
+    pub fn dump_all_edges(&self) -> Result<Vec<DumpedEdge>> {
+        let session = self.db.session();
+        let res = session
+            .execute("MATCH ()-[r]->() RETURN r")
+            .map_err(|e| anyhow!("dump edges: {e}"))?;
+        let mut out = Vec::with_capacity(res.row_count());
+        for row in res.rows() {
+            let Some(Value::Map(map)) = row.first() else {
+                bail!("dump edges: expected an edge map, got {:?}", row.first());
+            };
+            let endpoint = |key: &str| -> Result<i64> {
+                match map.get(key) {
+                    Some(Value::Int64(v)) => Ok(*v),
+                    other => Err(anyhow!("dump edges: bad {key} {other:?}")),
+                }
+            };
+            let edge_type = match map.get("_type") {
+                Some(Value::String(s)) => s.to_string(),
+                other => bail!("dump edges: bad _type {other:?}"),
+            };
+            let props = map
+                .iter()
+                .filter(|(k, _)| !matches!(k.as_str(), "_id" | "_source" | "_target" | "_type"))
+                .map(|(k, v)| (k.as_str().to_string(), v.clone()))
+                .collect();
+            out.push(DumpedEdge {
+                source: endpoint("_source")?,
+                target: endpoint("_target")?,
+                edge_type,
+                props,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Insert one node verbatim (labels + raw property values). DB-level API
+    /// so the write reaches the WAL; index maintenance is irrelevant here —
+    /// neither `index` nor `migrate` builds an HNSW (grafeo 0.5.x cannot
+    /// reload a persisted index in either storage format), query rebuilds
+    /// it per process.
+    pub fn insert_node_raw(&self, labels: &[&str], props: Vec<(String, Value)>) -> NodeId {
+        self.db.create_node_with_props(labels, props)
+    }
+
+    /// Insert one edge verbatim between already-inserted nodes.
+    pub fn insert_edge_raw(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        edge_type: &str,
+        props: Vec<(String, Value)>,
+    ) {
+        self.db
+            .create_edge_with_props(source, target, edge_type, props);
+    }
+
+    pub fn count_nodes(&self) -> Result<u64> {
+        self.count_via("MATCH (n) RETURN count(n)")
+    }
+
+    pub fn count_edges(&self) -> Result<u64> {
+        self.count_via("MATCH ()-[r]->() RETURN count(r)")
+    }
+
+    /// Count nodes carrying `label`. Callers pass fixed literals
+    /// (`Chunk` / `FileHash`), no injection surface.
+    pub fn count_label(&self, label: &str) -> Result<u64> {
+        self.count_via(&format!("MATCH (n:{label}) RETURN count(n)"))
+    }
+
+    fn count_via(&self, stmt: &str) -> Result<u64> {
+        let session = self.db.session();
+        let res = session
+            .execute(stmt)
+            .map_err(|e| anyhow!("count query `{stmt}`: {e}"))?;
+        match res.rows().first().and_then(|r| r.first()) {
+            Some(Value::Int64(v)) if *v >= 0 => Ok(*v as u64),
+            other => bail!("count query `{stmt}`: unexpected result {other:?}"),
+        }
+    }
+
+    /// Close the DB explicitly, flushing everything to disk. For single-file
+    /// (`.grafeo`) KBs this checkpoints all sections — HNSW topology included —
+    /// into the container file and removes the sidecar WAL. Dropping the store
+    /// closes implicitly, but callers that need durability before a subsequent
+    /// rename (migrate) call this to surface errors instead of swallowing them.
+    pub fn close(self) -> Result<()> {
+        self.db.close().map_err(|e| anyhow!("close grafeo DB: {e}"))
     }
 }
 
