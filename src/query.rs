@@ -91,11 +91,13 @@ async fn run_with_embedder(
         Some(_) => {}
     }
 
-    // grafeo 0.5.41 does not persist the HNSW vector index across DB open/close cycles
-    // (verified empirically — the procedure errors with "No vector index found for :Chunk(embedding)"
-    // on a fresh process even after `index` wrote chunks via upsert). Rebuild from current
-    // node state on every query path; under our < 10K chunks-per-KB assumption this
-    // is sub-second.
+    // grafeo (still true on 0.5.42, re-verified 2026-07-10) does not restore the
+    // HNSW vector index across process open/close for directory-format DBs — the
+    // procedure errors with "No vector index found for :Chunk(embedding)" on a
+    // fresh process. Rebuild from current node state once per query process; this
+    // is the ONLY place the index gets built (the index pipeline deliberately
+    // skips it — see `append_chunks_batch`). ~1.15ms per chunk at dim 2048
+    // (m=32, ef_construction=400): ~5s on a 4.6K-chunk KB.
     store.ensure_chunk_vector_index(dim)?;
 
     let q_vec = embedder.embed(text).await?;

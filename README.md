@@ -48,7 +48,7 @@ XD_KB_MAX_CHUNK_CHARS=8192
 
 模型名含 `voyage-context`（如 `voyage/voyage-context-4`）时自动切换为上下文化 chunk 嵌入模式，无需额外配置：
 
-- **索引**：同一文档的全部 chunk 作为一组、一文档一请求送嵌（嵌套 `input` + `input_type: "document"`），每个 chunk 向量同时编码块内细节与全文上下文；`--batch-size` 在此模式下不生效。单文档累计字符超过安全预算（60K chars）时按 chunk 边界拆为多组、多请求（组间失去互相上下文）。此模式下 `XD_KB_MAX_CHUNK_CHARS` 不得超过 60000（启动时校验报错），否则单个 chunk 可能永远塞不进一次请求。
+- **索引**：同一文档的全部 chunk 作为一组、一文档一请求送嵌（嵌套 `input` + `input_type: "document"`），每个 chunk 向量同时编码块内细节与全文上下文；`--batch-size` 在此模式下不生效。单文档累计字符超过安全预算（20K chars）时按 chunk 边界拆为多组、多请求（组间失去互相上下文）。预算依据：模型单文档上下文窗口 32K token 为硬限（contextualized 不支持截断，超限直接报错），中文按 ~1.5 token/char 估算，20K chars ≈ 30K token 留有余量。此模式下 `XD_KB_MAX_CHUNK_CHARS` 不得超过 20000（启动时校验报错），否则单个 chunk 可能永远塞不进一次请求。
 - **防降级**：一文档一请求的响应必须是两层嵌套形态；若网关回退返回普通扁平嵌入（丢失上下文语义），xd-kb 直接报错拒绝入库，不会静默降级。
 - **并发**：`index --concurrency <n>`（默认 4）控制同时在飞的嵌入请求数；DB 写入始终串行有序，失败隔离粒度不变。一文档一请求会显著放大请求数（请求数 ≈ 文件数），全量重建大库时并发是主要提速手段。普通模型路径同样生效。
 - **查询**：自动携带 `input_type: "query"`。
@@ -160,6 +160,8 @@ exclude:
 - `--lambda >= 1.0` 时该值被忽略（cosine 路径不消费候选池）。
 
 `--lambda` 取值范围 `[0.0, 1.0]` 闭区间，越界（含 `--lambda -0.1` 这种空格分隔的负值）一律以非零退出码 + `--lambda must be in [0.0, 1.0]` 错误信息退出。
+
+向量索引（HNSW）不随 DB 目录持久化（grafeo 目录格式限制）：`index` 子命令只写节点数据、不构建索引；`query` 每个进程启动时从节点数据重建一次（约 1ms/chunk，数千 chunk 的库约数秒），同进程内多次检索共享这一次构建。
 
 `--full` 控制每条命中的 `content` 字段渲染：缺省（紧凑）只取首行并截断到 120 字符，便于人眼浏览；`--full` 原样输出完整 chunk content（保留所有换行、每行 4 空格缩进、命中之间用一个空行分隔），其他列（序号、相似度分数、`<file>:<start>-<end>` 头）不变。LLM Agent / RAG 调用方应默认开启，避免再发 Read 取完整 chunk。
 

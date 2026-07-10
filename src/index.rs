@@ -411,12 +411,15 @@ fn collect_chunks_for_file(content: &str, rel_path: &str, limits: &ChunkLimits) 
     process_file(content, rel_path, limits)
 }
 
-/// Character budget per contextualized request. The API caps one request at
-/// 120K tokens; Chinese text can approach ~1.5 tokens per char, so 60K chars
-/// keeps worst-case requests safely under the cap. Documents exceeding the
-/// budget are split at chunk boundaries into consecutive groups — groups lose
-/// cross-group context, an accepted degradation for oversized documents.
-const CONTEXTUALIZED_REQUEST_CHAR_BUDGET: usize = 60_000;
+/// Character budget per contextualized request. The binding limit is NOT the
+/// 120K-token per-request cap but the model's 32K-token per-document context
+/// window (each inner `input` array must fit it; contextualized embeddings do
+/// not support truncation — oversize is a hard 4xx/5xx). Chinese text can
+/// approach ~1.5 tokens per char, so 20K chars keeps a worst-case group at
+/// ~30K tokens, under the window. Documents exceeding the budget are split at
+/// chunk boundaries into consecutive groups — groups lose cross-group
+/// context, an accepted degradation for oversized documents.
+const CONTEXTUALIZED_REQUEST_CHAR_BUDGET: usize = 20_000;
 
 /// Split the flat (file-ordered) chunk list into per-document request groups:
 /// one group per file, further split when a file's accumulated chunk chars
@@ -1378,6 +1381,7 @@ mod tests {
             n, 1,
             "expected exactly 1 chunk (the successful 细节 batch); got {n}"
         );
+        store.ensure_chunk_vector_index(TEST_DIM).unwrap(); // search needs a per-process index build
         let hits = store.search(&fake_vec(0.0, TEST_DIM), 100).unwrap();
         let a_hits: Vec<_> = hits
             .iter()
@@ -1454,6 +1458,7 @@ mod tests {
             .get_file_hash("世界观/X.md", HashDim::Vector)
             .unwrap()
             .expect("v1 hash present");
+        store.ensure_chunk_vector_index(TEST_DIM).unwrap(); // search needs a per-process index build
         let hits_v1 = store.search(&fake_vec(0.0, TEST_DIM), 10).unwrap();
         assert!(
             hits_v1.iter().any(|h| h.file_path == "世界观/X.md"),
@@ -1479,6 +1484,7 @@ mod tests {
         );
 
         // search MUST NOT surface any chunk for this file anymore
+        store.ensure_chunk_vector_index(TEST_DIM).unwrap(); // rebuild to pick up v2 state
         let hits_v2 = store.search(&fake_vec(0.0, TEST_DIM), 10).unwrap();
         assert!(
             hits_v2.iter().all(|h| h.file_path != "世界观/X.md"),
@@ -1524,6 +1530,7 @@ mod tests {
         .await
         .expect("indexing should succeed");
 
+        store.ensure_chunk_vector_index(TEST_DIM).unwrap(); // search needs a per-process index build
         let hits = store.search(&fake_vec(0.0, TEST_DIM), 100).unwrap();
         let big_hits: Vec<_> = hits
             .iter()
@@ -2326,7 +2333,7 @@ mod tests {
         let root = tmp.path().join("docs");
         std::fs::create_dir_all(&root).unwrap();
         // 概述 body of 70K chars → split_oversized cuts it into ~9 chunks of
-        // ≤ 8192 chars; total chars > CONTEXTUALIZED_REQUEST_CHAR_BUDGET (60K)
+        // ≤ 8192 chars; total chars > CONTEXTUALIZED_REQUEST_CHAR_BUDGET (20K)
         // forces contextualized_groups to emit ≥ 2 groups for this one file.
         let body = worldview_doc("Big", &"长句内容。".repeat(14_000));
         write_md(&root, "世界观/Big.md", &body);

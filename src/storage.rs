@@ -251,7 +251,14 @@ impl KbStore {
     ///
     /// Dim validation runs BEFORE the transaction opens (same shape as
     /// [`Self::upsert_chunks_for_file`]); a mismatched-dim chunk fails fast
-    /// with no DB state change. After commit, the vector index is rebuilt.
+    /// with no DB state change.
+    ///
+    /// This method does NOT touch the vector index. grafeo does not restore
+    /// the HNSW across process open/close for directory-format DBs (verified
+    /// empirically on 0.5.42), and grafeo's `create_vector_index` is a full
+    /// scan-and-rebuild — calling it per batch made indexing O(n²) in total
+    /// chunks. Search callers rebuild once per process instead (see
+    /// `ensure_chunk_vector_index`; the query pipeline does this).
     pub fn append_chunks_batch(
         &self,
         chunks: &[ChunkInput<'_>],
@@ -349,11 +356,10 @@ impl KbStore {
             }
         }
 
-        // Rebuild the vector index so freshly-inserted chunks are visible to
-        // CALL grafeo.search.vector. Same rationale as upsert_chunks_for_file.
-        if let Some(d) = chunk_dim {
-            self.ensure_chunk_vector_index(d)?;
-        }
+        // Deliberately NO ensure_chunk_vector_index here — the rebuilt index
+        // would die with this process anyway (grafeo directory-format DBs do
+        // not restore the HNSW on reopen), and per-batch rebuilds are O(n²).
+        // Search paths rebuild once per process.
         Ok(())
     }
 
@@ -1470,6 +1476,9 @@ mod tests {
             .expect("clear+insert batch must succeed");
 
         assert_eq!(count_chunks(&store, "a.md"), 2);
+        // append_chunks_batch no longer maintains the index — rebuild before
+        // searching, mirroring the per-process build the query pipeline does.
+        store.ensure_chunk_vector_index(4).unwrap();
         let hits = store.search(&embed(&[1.0, 0.0, 0.0]), 10).unwrap();
         let bodies: Vec<_> = hits.iter().map(|h| h.content.clone()).collect();
         assert!(bodies.contains(&"new1".to_string()), "got {bodies:?}");
